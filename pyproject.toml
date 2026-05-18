@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cresso"
+version = "0.5.0"
+description = "CRESSO5: a compact-state contact-refractory multihash spectral optimizer for PyTorch."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+authors = [
+  { name = "win10ogod" }
+]
+keywords = [
+  "pytorch",
+  "optimizer",
+  "cuda",
+  "spectral-optimizer",
+  "low-vram",
+  "lora",
+  "training"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+  "torch"
+]
+
+[project.urls]
+Homepage = "https://github.com/win10ogod/cresso"
+Repository = "https://github.com/win10ogod/cresso"
+
+[tool.setuptools]
+py-modules = ["cresso_v3", "cresso_v4", "cresso_v5", "cresso_cuda_ext"]
+packages = ["cresso_cuda"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+cresso_cuda = ["*.cpp", "*.cu"]

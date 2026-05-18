@@ -1,0 +1,5 @@
+include LICENSE
+include README.md
+include cresso_cuda/*.cpp
+include cresso_cuda/*.cu
+include tests/*.py

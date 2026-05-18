@@ -28,6 +28,7 @@ actual parameter update are dense.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Iterable, Optional, Sequence, Tuple
 
 import torch
@@ -40,6 +41,58 @@ __all__ = [
     "count_optimizer_state_elements",
     "theoretical_state_elements",
 ]
+
+
+_CRESSO_CUDA_OPS = None
+_CRESSO_CUDA_ERROR: Exception | None = None
+_CRESSO_CUDA_WARNED = False
+
+
+def _load_cuda_ops(required: bool = False):
+    """Load optional fused CUDA operators for CRESSO5.
+
+    The PyTorch implementation remains the reference fallback. Use
+    cuda_ops="required" on CRESSO5 to make extension load failures explicit.
+    """
+    global _CRESSO_CUDA_OPS, _CRESSO_CUDA_ERROR, _CRESSO_CUDA_WARNED
+    if _CRESSO_CUDA_OPS is not None:
+        return _CRESSO_CUDA_OPS
+    if _CRESSO_CUDA_ERROR is not None:
+        if required:
+            raise RuntimeError(f"CRESSO5 CUDA ops failed to load: {_CRESSO_CUDA_ERROR}") from _CRESSO_CUDA_ERROR
+        return None
+    if not torch.cuda.is_available():
+        msg = "CRESSO5 CUDA ops require torch.cuda.is_available()"
+        if required:
+            raise RuntimeError(msg)
+        return None
+    try:
+        from cresso_cuda_ext import load_cuda_ops
+
+        _CRESSO_CUDA_OPS = load_cuda_ops()
+        return _CRESSO_CUDA_OPS
+    except Exception as exc:  # pragma: no cover - exercised only on local build failures
+        _CRESSO_CUDA_ERROR = exc
+        if required:
+            raise RuntimeError(f"CRESSO5 CUDA ops failed to load: {exc}") from exc
+        if not _CRESSO_CUDA_WARNED:
+            warnings.warn(
+                f"CRESSO5 CUDA ops unavailable, falling back to PyTorch reference path: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _CRESSO_CUDA_WARNED = True
+        return None
+
+
+class _CudaBasisCache:
+    __slots__ = ("ops", "shape", "stats", "axis_cache")
+
+    def __init__(self, ops, shape: Sequence[int], stats: Tensor, axis_cache: Tensor | None = None) -> None:
+        self.ops = ops
+        self.shape = tuple(int(d) for d in shape)
+        self.stats = stats
+        self.axis_cache = axis_cache
 
 
 def _validate_scalar(name: str, value: float, lower: float | None = None, upper: float | None = None) -> None:
@@ -318,17 +371,49 @@ def _basis_pairs_for_step(
     rank: int,
     dtype: torch.dtype,
     cache_limit_elements: int,
-) -> list[Tuple[Tensor, Tensor]] | None:
+    cuda_ops_mode: str = "auto",
+    cuda_stats: Tensor | None = None,
+    cuda_axis_cache: Tensor | None = None,
+) -> list[Tuple[Tensor, Tensor]] | _CudaBasisCache | None:
     """Build a transient per-step basis cache when it is small enough."""
     n = 1
     for d in shape:
         n *= int(d)
+    if (
+        rank > 0
+        and freqs.is_cuda
+        and dtype in (torch.float32, torch.float64)
+        and len(shape) <= 8
+        and str(cuda_ops_mode) != "off"
+    ):
+        ops = _load_cuda_ops(required=str(cuda_ops_mode) == "required")
+        if ops is not None:
+            axis_cache = cuda_axis_cache if cuda_axis_cache is not None else ops.basis_axis_cache(freqs, [int(d) for d in shape])
+            stats = cuda_stats if cuda_stats is not None else ops.basis_stats_with_cache(freqs, [int(d) for d in shape], axis_cache)
+            return _CudaBasisCache(ops, shape, stats, axis_cache)
     if int(cache_limit_elements) <= 0 or 2 * int(rank) * n > int(cache_limit_elements):
         return None
     return [_basis_pair(shape, freqs, r, dtype) for r in range(rank)]
 
 
-def _project_step(x: Tensor, freqs: Tensor, rank: int, basis_pairs: list[Tuple[Tensor, Tensor]] | None) -> Tuple[Tensor, Tensor]:
+def _project_step(
+    x: Tensor,
+    freqs: Tensor,
+    rank: int,
+    basis_pairs: list[Tuple[Tensor, Tensor]] | _CudaBasisCache | None,
+) -> Tuple[Tensor, Tensor]:
+    if isinstance(basis_pairs, _CudaBasisCache):
+        if basis_pairs.axis_cache is not None:
+            return tuple(
+                basis_pairs.ops.basis_project_with_cache(
+                    x.contiguous(), freqs, list(basis_pairs.shape), basis_pairs.stats, basis_pairs.axis_cache
+                )
+            )  # type: ignore[return-value]
+        return tuple(
+            basis_pairs.ops.basis_project_with_stats(
+                x.contiguous(), freqs, list(basis_pairs.shape), basis_pairs.stats
+            )
+        )  # type: ignore[return-value]
     if basis_pairs is None:
         return _project(x, freqs, rank)
     cos_coeff = torch.empty(rank, device=x.device, dtype=x.dtype)
@@ -346,8 +431,31 @@ def _reconstruct_step(
     shape: Sequence[int],
     dtype: torch.dtype,
     gates: Tensor | None = None,
-    basis_pairs: list[Tuple[Tensor, Tensor]] | None = None,
+    basis_pairs: list[Tuple[Tensor, Tensor]] | _CudaBasisCache | None = None,
 ) -> Tensor:
+    if isinstance(basis_pairs, _CudaBasisCache):
+        if gates is None:
+            gate_tensor = torch.empty(0, device=cos_coeff.device, dtype=cos_coeff.dtype)
+        else:
+            gate_tensor = gates.to(device=cos_coeff.device, dtype=cos_coeff.dtype).contiguous()
+        if basis_pairs.axis_cache is not None:
+            return basis_pairs.ops.basis_reconstruct_with_cache(
+                cos_coeff.contiguous(),
+                sin_coeff.contiguous(),
+                freqs,
+                [int(d) for d in shape],
+                gate_tensor,
+                basis_pairs.stats,
+                basis_pairs.axis_cache,
+            )
+        return basis_pairs.ops.basis_reconstruct_with_stats(
+            cos_coeff.contiguous(),
+            sin_coeff.contiguous(),
+            freqs,
+            [int(d) for d in shape],
+            gate_tensor,
+            basis_pairs.stats,
+        )
     if basis_pairs is None:
         return _reconstruct(cos_coeff, sin_coeff, freqs, shape, dtype, gates)
     rank = int(cos_coeff.numel())
@@ -499,6 +607,7 @@ class CRESSO5(Optimizer):
         spike_mix: float = 0.25,
         min_spectral_size: int = 1024,
         basis_cache_limit_elements: int = 2_000_000,
+        cuda_ops: str | bool = "auto",
         hard_channel_min_size: int = 16,
         thin_matrix_hard_cutoff: int = 8,
         maximize: bool = False,
@@ -571,6 +680,12 @@ class CRESSO5(Optimizer):
             raise ValueError("warmup_steps must be non-negative")
         if min_gain > max_gain:
             raise ValueError("min_gain must be <= max_gain")
+        if isinstance(cuda_ops, bool):
+            cuda_ops_mode = "auto" if cuda_ops else "off"
+        else:
+            cuda_ops_mode = str(cuda_ops).lower()
+        if cuda_ops_mode not in {"auto", "required", "off"}:
+            raise ValueError("cuda_ops must be one of 'auto', 'required', or 'off'")
 
         defaults = dict(
             lr=float(lr),
@@ -622,6 +737,7 @@ class CRESSO5(Optimizer):
             spike_mix=float(spike_mix),
             min_spectral_size=int(min_spectral_size),
             basis_cache_limit_elements=int(basis_cache_limit_elements),
+            cuda_ops=cuda_ops_mode,
             hard_channel_min_size=int(hard_channel_min_size),
             thin_matrix_hard_cutoff=int(thin_matrix_hard_cutoff),
             maximize=bool(maximize),
@@ -756,9 +872,26 @@ class CRESSO5(Optimizer):
         freqs: Tensor = state["freqs"]
         rank = int(state["omega"].numel())
         omega = state["omega"].to(dtype=state["q_cos"].dtype)
+        cuda_stats = state.get("basis_stats")
+        cuda_axis_cache = state.get("basis_axis_cache")
         basis_pairs = _basis_pairs_for_step(
-            tuple(param.shape), freqs, rank, dtype, int(group["basis_cache_limit_elements"])
+            tuple(param.shape),
+            freqs,
+            rank,
+            dtype,
+            int(group["basis_cache_limit_elements"]),
+            str(group.get("cuda_ops", "auto")),
+            cuda_stats if torch.is_tensor(cuda_stats) else None,
+            cuda_axis_cache if torch.is_tensor(cuda_axis_cache) else None,
         )
+        if isinstance(basis_pairs, _CudaBasisCache) and "basis_stats" not in state:
+            # Deterministic per-shape/per-frequency normalization data. This is
+            # tiny O(rank) state and removes a full-tensor stats pass every step.
+            state["basis_stats"] = basis_pairs.stats.detach()
+        if isinstance(basis_pairs, _CudaBasisCache) and basis_pairs.axis_cache is not None and "basis_axis_cache" not in state:
+            # Compact O(rank * ndim * max_dim) axis trigonometry cache. It avoids
+            # dense basis tensors while removing per-step cos/sin/exp evaluation.
+            state["basis_axis_cache"] = basis_pairs.axis_cache.detach()
         thin_cutoff = int(group["thin_matrix_hard_cutoff"])
         thin_matrix = param.ndim == 2 and thin_cutoff > 0 and min(param.shape) <= thin_cutoff
         hard_enabled = param.numel() >= int(group["hard_channel_min_size"]) and not thin_matrix
@@ -767,25 +900,50 @@ class CRESSO5(Optimizer):
         # not a dense historical accumulator.
         rel = (force.abs() / scale + eps).clamp(max=1.0e4)
         hash_indices: list[Tensor] | None = None
+        hash_salts: list[int] | None = None
         hash_metric = 1.0
         hash_pred = 0.0
         bins = int(group["hash_bins"])
         tables = int(group.get("hash_tables", 1))
         if hard_enabled and bins > 0 and "hash_energy" in state:
-            hash_indices = []
+            cuda_mode = str(group.get("cuda_ops", "auto"))
+            hash_cuda_ops = None
+            if (
+                cuda_mode != "off"
+                and rel.is_cuda
+                and rel.dtype in (torch.float32, torch.float64)
+                and bins <= 4096
+                and param.ndim <= 8
+            ):
+                hash_cuda_ops = basis_pairs.ops if isinstance(basis_pairs, _CudaBasisCache) else _load_cuda_ops(required=cuda_mode == "required")
+            if hash_cuda_ops is None:
+                hash_indices = []
+            else:
+                hash_salts = []
             log_hash_metric: Tensor | None = None
             h_energy_all: Tensor = state["hash_energy"]
             for table in range(tables):
-                hash_idx_t = _hash_index_tensor(tuple(param.shape), bins, param.device, salt=table)
-                hash_indices.append(hash_idx_t)
-                cell_density = _hash_reduce_mean(rel.pow(float(group["energy_power"])), hash_idx_t, bins)
+                density_source = rel.pow(float(group["energy_power"]))
+                if hash_cuda_ops is None:
+                    hash_idx_t = _hash_index_tensor(tuple(param.shape), bins, param.device, salt=table)
+                    assert hash_indices is not None
+                    hash_indices.append(hash_idx_t)
+                    cell_density = _hash_reduce_mean(density_source, hash_idx_t, bins)
+                else:
+                    assert hash_salts is not None
+                    hash_salts.append(table)
+                    cell_density = hash_cuda_ops.hash_reduce_mean(density_source.contiguous(), bins, table)
                 h_energy = h_energy_all[table]
                 if step <= 1:
                     h_energy.copy_(cell_density.to(h_energy.dtype))
                 else:
                     h_energy.mul_(float(group["hash_decay"])).add_(cell_density.to(h_energy.dtype), alpha=1.0 - float(group["hash_decay"]))
                 hm = (h_energy.to(dtype) / h_energy.to(dtype).mean().clamp_min(eps)).clamp_min(eps)
-                hmt = hm.pow(float(group["hash_metric_coupling"]) / max(0.25, float(group["energy_power"])))[hash_idx_t].clamp(0.08, 12.0)
+                hm_pow = hm.pow(float(group["hash_metric_coupling"]) / max(0.25, float(group["energy_power"])))
+                if hash_cuda_ops is None:
+                    hmt = hm_pow[hash_idx_t].clamp(0.08, 12.0)
+                else:
+                    hmt = hash_cuda_ops.hash_gather(hm_pow.contiguous(), [int(d) for d in param.shape], table).clamp(0.08, 12.0)
                 term = torch.log(hmt.clamp_min(eps))
                 log_hash_metric = term if log_hash_metric is None else log_hash_metric + term
             assert log_hash_metric is not None
@@ -843,21 +1001,36 @@ class CRESSO5(Optimizer):
         pcos_port = pcos_port.to(qcos.dtype)
         psin_port = psin_port.to(qsin.dtype)
 
-        if hash_indices is not None and "hash_impulse" in state:
+        if (hash_indices is not None or hash_salts is not None) and "hash_impulse" in state:
             h_ref_all: Tensor = state["hash_refractory"]
             h_imp_all: Tensor = state["hash_impulse"]
             pred_acc: Tensor | None = None
-            for table, hash_idx_t in enumerate(hash_indices):
-                cell_port = _hash_reduce_mean(port_source, hash_idx_t, bins).to(h_imp_all.dtype)
+            if hash_salts is not None:
+                cuda_mode = str(group.get("cuda_ops", "auto"))
+                hash_cuda_ops = basis_pairs.ops if isinstance(basis_pairs, _CudaBasisCache) else _load_cuda_ops(required=cuda_mode == "required")
+                hash_iter = [(table, None) for table in hash_salts]
+            else:
+                hash_cuda_ops = None
+                assert hash_indices is not None
+                hash_iter = list(enumerate(hash_indices))
+            for table, hash_idx_t in hash_iter:
+                if hash_cuda_ops is None:
+                    assert hash_idx_t is not None
+                    cell_port = _hash_reduce_mean(port_source, hash_idx_t, bins).to(h_imp_all.dtype)
+                else:
+                    cell_port = hash_cuda_ops.hash_reduce_mean(port_source.contiguous(), bins, table).to(h_imp_all.dtype)
                 h_ref = h_ref_all[table]
                 h_imp = h_imp_all[table]
                 h_ref.mul_(float(group["hash_decay"])).add_(cell_port.abs(), alpha=1.0 - float(group["hash_decay"]))
                 h_gate = 1.0 / (1.0 + float(group["refractory_gain"]) * h_ref)
                 h_imp.mul_(float(group["hash_impulse_decay"])).add_(cell_port * h_gate, alpha=1.0 - float(group["hash_impulse_decay"]))
-                retrieved = h_imp.to(dtype)[hash_idx_t]
+                if hash_cuda_ops is None:
+                    retrieved = h_imp.to(dtype)[hash_idx_t]
+                else:
+                    retrieved = hash_cuda_ops.hash_gather(h_imp.to(dtype).contiguous(), [int(d) for d in param.shape], table)
                 pred_acc = retrieved if pred_acc is None else pred_acc + retrieved
             assert pred_acc is not None
-            hash_pred = pred_acc / float(len(hash_indices))
+            hash_pred = pred_acc / float(len(hash_salts) if hash_salts is not None else len(hash_indices))
 
         # Mode confidence is a refractory reliability trace: modes receiving consistent nonzero
         # error become trusted; modes with noisy sign-inconsistent excitation are damped.
