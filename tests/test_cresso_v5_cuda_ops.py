@@ -104,6 +104,36 @@ class CressoV5CudaOpsTests(unittest.TestCase):
         ):
             torch.testing.assert_close(cuda_state[name], ref_state[name], rtol=8e-4, atol=8e-5)
 
+    def test_cuda_fast_path_does_not_add_persistent_basis_cache_state(self) -> None:
+        shape = (128, 128)
+        device = torch.device("cuda")
+        p = torch.nn.Parameter(torch.randn(shape, device=device, dtype=torch.float32))
+        p.grad = torch.randn_like(p)
+        opt = cresso_v5.CRESSO5(
+            [p],
+            cuda_ops="required",
+            lr=2.0e-3,
+            rank=4,
+            max_frequency=3,
+            min_spectral_size=1,
+            hard_channel_min_size=1,
+            thin_matrix_hard_cutoff=0,
+            hash_bins=16,
+            hash_tables=1,
+            basis_cache_limit_elements=0,
+        )
+
+        opt.step()
+        torch.cuda.synchronize()
+
+        state = opt.state[p]
+        self.assertNotIn("basis_stats", state)
+        self.assertNotIn("basis_axis_cache", state)
+        self.assertEqual(
+            cresso_v5.count_optimizer_state_elements(opt),
+            cresso_v5.theoretical_state_elements(shape, rank=4, hash_bins=16, hash_tables=1),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

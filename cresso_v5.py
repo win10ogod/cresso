@@ -372,8 +372,6 @@ def _basis_pairs_for_step(
     dtype: torch.dtype,
     cache_limit_elements: int,
     cuda_ops_mode: str = "auto",
-    cuda_stats: Tensor | None = None,
-    cuda_axis_cache: Tensor | None = None,
 ) -> list[Tuple[Tensor, Tensor]] | _CudaBasisCache | None:
     """Build a transient per-step basis cache when it is small enough."""
     n = 1
@@ -388,8 +386,8 @@ def _basis_pairs_for_step(
     ):
         ops = _load_cuda_ops(required=str(cuda_ops_mode) == "required")
         if ops is not None:
-            axis_cache = cuda_axis_cache if cuda_axis_cache is not None else ops.basis_axis_cache(freqs, [int(d) for d in shape])
-            stats = cuda_stats if cuda_stats is not None else ops.basis_stats_with_cache(freqs, [int(d) for d in shape], axis_cache)
+            axis_cache = ops.basis_axis_cache(freqs, [int(d) for d in shape])
+            stats = ops.basis_stats_with_cache(freqs, [int(d) for d in shape], axis_cache)
             return _CudaBasisCache(ops, shape, stats, axis_cache)
     if int(cache_limit_elements) <= 0 or 2 * int(rank) * n > int(cache_limit_elements):
         return None
@@ -872,8 +870,6 @@ class CRESSO5(Optimizer):
         freqs: Tensor = state["freqs"]
         rank = int(state["omega"].numel())
         omega = state["omega"].to(dtype=state["q_cos"].dtype)
-        cuda_stats = state.get("basis_stats")
-        cuda_axis_cache = state.get("basis_axis_cache")
         basis_pairs = _basis_pairs_for_step(
             tuple(param.shape),
             freqs,
@@ -881,17 +877,7 @@ class CRESSO5(Optimizer):
             dtype,
             int(group["basis_cache_limit_elements"]),
             str(group.get("cuda_ops", "auto")),
-            cuda_stats if torch.is_tensor(cuda_stats) else None,
-            cuda_axis_cache if torch.is_tensor(cuda_axis_cache) else None,
         )
-        if isinstance(basis_pairs, _CudaBasisCache) and "basis_stats" not in state:
-            # Deterministic per-shape/per-frequency normalization data. This is
-            # tiny O(rank) state and removes a full-tensor stats pass every step.
-            state["basis_stats"] = basis_pairs.stats.detach()
-        if isinstance(basis_pairs, _CudaBasisCache) and basis_pairs.axis_cache is not None and "basis_axis_cache" not in state:
-            # Compact O(rank * ndim * max_dim) axis trigonometry cache. It avoids
-            # dense basis tensors while removing per-step cos/sin/exp evaluation.
-            state["basis_axis_cache"] = basis_pairs.axis_cache.detach()
         thin_cutoff = int(group["thin_matrix_hard_cutoff"])
         thin_matrix = param.ndim == 2 and thin_cutoff > 0 and min(param.shape) <= thin_cutoff
         hard_enabled = param.numel() >= int(group["hard_channel_min_size"]) and not thin_matrix

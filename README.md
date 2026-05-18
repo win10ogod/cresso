@@ -39,12 +39,16 @@ small kernel launches and repeated `cos` / `sin` / hash work.
 
 CRESSO5 now includes fused CUDA C++ operators for the heavy pieces:
 
-- compact axis trigonometry cache,
+- compact transient axis trigonometry workspace,
 - basis normalization stats,
 - basis projection,
 - basis reconstruction,
 - coordinate hash reduce-mean,
 - coordinate hash gather.
+
+The CUDA workspace is rebuilt inside `step()` and is not stored in optimizer
+state or serialized in `state_dict()`. This keeps the original persistent-state
+contract intact.
 
 The CUDA path is enabled by default with `cuda_ops="auto"`. If CUDA extension
 loading fails, CRESSO5 falls back to the PyTorch reference path. Use
@@ -57,7 +61,7 @@ Measured on an NVIDIA RTX PRO 6000 Blackwell Workstation Edition with PyTorch
 
 | Case | PyTorch path | CUDA path | Speedup |
 | --- | ---: | ---: | ---: |
-| Single tensor `(2048, 2048)`, rank=8 | 50.822 ms/step | 11.212 ms/step | 4.53x |
+| Single tensor `(2048, 2048)`, rank=8 | 64.580 ms/step | 12.376 ms/step | 5.22x |
 | Single tensor `(4096, 4096)`, rank=8 | 97.635 ms/step | 34.411 ms/step | 2.84x |
 | 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=8 | 2802.094 ms/step | 360.247 ms/step | 7.78x |
 
@@ -186,7 +190,8 @@ the actual optimizer object is already supplied.
 - `hash_bins`: number of cells per hash table.
 - `hash_tables`: number of independent salted hash tables.
 - `basis_cache_limit_elements`: pure PyTorch dense transient basis cache limit.
-  The CUDA path uses compact axis cache instead of dense basis tensors.
+  The CUDA path uses compact transient axis workspace instead of dense basis
+  tensors or persistent basis-cache state.
 - `hard_channel_min_size`: minimum tensor size for hash/refractory hard-channel
   logic.
 - `thin_matrix_hard_cutoff`: disables hard-channel logic for very thin matrices
