@@ -1127,6 +1127,94 @@ torch::Tensor hash_gather_cuda(torch::Tensor values, std::vector<int64_t> sizes,
 namespace {
 
 template <typename scalar_t>
+__global__ void hash_reset_accum_kernel(scalar_t* sums, int32_t* counts, int64_t bins) {
+    for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; b < bins;
+         b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        sums[b] = static_cast<scalar_t>(0);
+        counts[b] = 0;
+    }
+}
+
+template <typename scalar_t>
+__global__ void hash_metric_finalize_update_kernel(
+    const scalar_t* sums,
+    const int32_t* counts,
+    int64_t bins,
+    int64_t step,
+    double hash_decay,
+    scalar_t* hash_energy,
+    double* mean_out) {
+    double local = 0.0;
+    for (int64_t b = threadIdx.x; b < bins; b += blockDim.x) {
+        const int32_t count = counts[b];
+        const double cell = count > 0 ? static_cast<double>(sums[b]) / static_cast<double>(count) : 0.0;
+        const double updated =
+            step <= 1 ? cell : hash_decay * static_cast<double>(hash_energy[b]) + (1.0 - hash_decay) * cell;
+        hash_energy[b] = static_cast<scalar_t>(updated);
+        local += updated;
+    }
+    extern __shared__ double shared[];
+    const int tid = threadIdx.x;
+    shared[tid] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        mean_out[0] = shared[0] / static_cast<double>(bins);
+    }
+}
+
+template <typename scalar_t>
+__global__ void hash_metric_log_gather_kernel(
+    const scalar_t* hash_energy,
+    const double* mean,
+    scalar_t* out,
+    int64_t n,
+    int64_t bins,
+    int64_t salt,
+    double exponent,
+    double eps) {
+    const double mean_v = mean[0] < eps ? eps : mean[0];
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t b = cresso_hash_index(i, bins, salt);
+        double hm = static_cast<double>(hash_energy[b]) / mean_v;
+        hm = hm < eps ? eps : hm;
+        double hmt = pow(hm, exponent);
+        hmt = hmt < 0.08 ? 0.08 : (hmt > 12.0 ? 12.0 : hmt);
+        out[i] = static_cast<scalar_t>(log(hmt < eps ? eps : hmt));
+    }
+}
+
+template <typename scalar_t>
+__global__ void hash_impulse_update_kernel(
+    const scalar_t* sums,
+    const int32_t* counts,
+    int64_t bins,
+    double hash_decay,
+    double hash_impulse_decay,
+    double refractory_gain,
+    scalar_t* hash_refractory,
+    scalar_t* hash_impulse) {
+    for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; b < bins;
+         b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int32_t count = counts[b];
+        const double cell = count > 0 ? static_cast<double>(sums[b]) / static_cast<double>(count) : 0.0;
+        const double ref =
+            hash_decay * static_cast<double>(hash_refractory[b]) + (1.0 - hash_decay) * fabs(cell);
+        hash_refractory[b] = static_cast<scalar_t>(ref);
+        const double gate = 1.0 / (1.0 + refractory_gain * ref);
+        const double impulse =
+            hash_impulse_decay * static_cast<double>(hash_impulse[b]) + (1.0 - hash_impulse_decay) * cell * gate;
+        hash_impulse[b] = static_cast<scalar_t>(impulse);
+    }
+}
+
+template <typename scalar_t>
 __global__ void metric_update_kernel(
     scalar_t* metric_cos,
     scalar_t* metric_sin,
@@ -1266,6 +1354,282 @@ void check_rank_tensor(torch::Tensor t, int64_t rank, const char* name) {
 
 }  // namespace
 
+torch::Tensor hash_metric_update_log_cuda(
+    torch::Tensor density_source,
+    torch::Tensor hash_energy,
+    std::vector<int64_t> sizes,
+    int64_t salt,
+    int64_t step,
+    double hash_decay,
+    double hash_metric_coupling,
+    double energy_power,
+    double eps) {
+    const ShapeInfo shape = make_shape_info(sizes);
+    TORCH_CHECK(density_source.is_cuda(), "density_source must be CUDA");
+    TORCH_CHECK(density_source.scalar_type() == at::kFloat || density_source.scalar_type() == at::kDouble, "density_source must be float32 or float64");
+    TORCH_CHECK(density_source.numel() == shape.numel, "density_source numel mismatch");
+    TORCH_CHECK(hash_energy.is_cuda(), "hash_energy must be CUDA");
+    TORCH_CHECK(hash_energy.dim() == 1 && hash_energy.numel() > 0, "hash_energy must be non-empty 1D");
+    TORCH_CHECK(hash_energy.scalar_type() == density_source.scalar_type(), "hash_energy dtype must match density_source");
+    const c10::cuda::CUDAGuard device_guard(density_source.device());
+    auto x_c = density_source.contiguous();
+    const int64_t bins = hash_energy.numel();
+    TORCH_CHECK(bins <= 4096, "CRESSO5 CUDA hash metric supports up to 4096 bins");
+    auto sums = torch::empty({bins}, x_c.options());
+    auto counts = torch::empty({bins}, x_c.options().dtype(torch::kInt32));
+    auto mean = torch::empty({1}, x_c.options().dtype(torch::kFloat64));
+    auto out = torch::empty(sizes, x_c.options());
+    const int bin_blocks = std::min<int64_t>(1024, std::max<int64_t>(1, (bins + kThreads - 1) / kThreads));
+    const int value_blocks = std::min<int64_t>(65535, std::max<int64_t>(1, (x_c.numel() + 1023) / 1024));
+    AT_DISPATCH_FLOATING_TYPES(x_c.scalar_type(), "hash_metric_update_log_cuda", [&] {
+        hash_reset_accum_kernel<scalar_t><<<bin_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>(),
+            bins);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const size_t shared_bytes = static_cast<size_t>(bins) * (sizeof(scalar_t) + sizeof(int32_t));
+        hash_reduce_sum_kernel<scalar_t><<<value_blocks, kThreads, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            x_c.data_ptr<scalar_t>(),
+            x_c.numel(),
+            bins,
+            salt,
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        hash_metric_finalize_update_kernel<scalar_t><<<
+            1,
+            kThreads,
+            kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>(),
+            bins,
+            step,
+            hash_decay,
+            hash_energy.data_ptr<scalar_t>(),
+            mean.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const double exponent = hash_metric_coupling / std::max(0.25, energy_power);
+        hash_metric_log_gather_kernel<scalar_t><<<value_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hash_energy.data_ptr<scalar_t>(),
+            mean.data_ptr<double>(),
+            out.data_ptr<scalar_t>(),
+            x_c.numel(),
+            bins,
+            salt,
+            exponent,
+            eps);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor hash_impulse_update_gather_cuda(
+    torch::Tensor port_source,
+    torch::Tensor hash_refractory,
+    torch::Tensor hash_impulse,
+    std::vector<int64_t> sizes,
+    int64_t salt,
+    double hash_decay,
+    double hash_impulse_decay,
+    double refractory_gain) {
+    const ShapeInfo shape = make_shape_info(sizes);
+    TORCH_CHECK(port_source.is_cuda(), "port_source must be CUDA");
+    TORCH_CHECK(port_source.scalar_type() == at::kFloat || port_source.scalar_type() == at::kDouble, "port_source must be float32 or float64");
+    TORCH_CHECK(port_source.numel() == shape.numel, "port_source numel mismatch");
+    TORCH_CHECK(hash_refractory.is_cuda() && hash_impulse.is_cuda(), "hash state must be CUDA");
+    TORCH_CHECK(hash_refractory.dim() == 1 && hash_impulse.dim() == 1 && hash_refractory.numel() == hash_impulse.numel(), "hash state shape mismatch");
+    TORCH_CHECK(hash_refractory.scalar_type() == port_source.scalar_type() && hash_impulse.scalar_type() == port_source.scalar_type(), "hash state dtype mismatch");
+    const c10::cuda::CUDAGuard device_guard(port_source.device());
+    auto x_c = port_source.contiguous();
+    const int64_t bins = hash_impulse.numel();
+    TORCH_CHECK(bins <= 4096, "CRESSO5 CUDA hash impulse supports up to 4096 bins");
+    auto sums = torch::empty({bins}, x_c.options());
+    auto counts = torch::empty({bins}, x_c.options().dtype(torch::kInt32));
+    auto out = torch::empty(sizes, x_c.options());
+    const int bin_blocks = std::min<int64_t>(1024, std::max<int64_t>(1, (bins + kThreads - 1) / kThreads));
+    const int value_blocks = std::min<int64_t>(65535, std::max<int64_t>(1, (x_c.numel() + 1023) / 1024));
+    AT_DISPATCH_FLOATING_TYPES(x_c.scalar_type(), "hash_impulse_update_gather_cuda", [&] {
+        hash_reset_accum_kernel<scalar_t><<<bin_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>(),
+            bins);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const size_t shared_bytes = static_cast<size_t>(bins) * (sizeof(scalar_t) + sizeof(int32_t));
+        hash_reduce_sum_kernel<scalar_t><<<value_blocks, kThreads, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            x_c.data_ptr<scalar_t>(),
+            x_c.numel(),
+            bins,
+            salt,
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        hash_impulse_update_kernel<scalar_t><<<bin_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            sums.data_ptr<scalar_t>(),
+            counts.data_ptr<int32_t>(),
+            bins,
+            hash_decay,
+            hash_impulse_decay,
+            refractory_gain,
+            hash_refractory.data_ptr<scalar_t>(),
+            hash_impulse.data_ptr<scalar_t>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        hash_gather_kernel<scalar_t><<<value_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hash_impulse.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            x_c.numel(),
+            bins,
+            salt);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+namespace {
+
+template <typename scalar_t>
+__global__ void axis_metric_reset_kernel(scalar_t* rows, scalar_t* cols, int64_t row_count, int64_t col_count) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < row_count + col_count;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        if (i < row_count) {
+            rows[i] = static_cast<scalar_t>(0);
+        } else {
+            cols[i - row_count] = static_cast<scalar_t>(0);
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void axis_metric_sum_kernel(
+    const scalar_t* rel,
+    scalar_t* rows,
+    scalar_t* cols,
+    int64_t row_count,
+    int64_t col_count,
+    double power,
+    double eps) {
+    const int64_t n = row_count * col_count;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        double v = static_cast<double>(rel[i]);
+        v = v < eps ? eps : v;
+        v = pow(v, power);
+        v = v > 1.0e6 ? 1.0e6 : v;
+        const int64_t row = i / col_count;
+        const int64_t col = i - row * col_count;
+        atomicAdd(rows + row, static_cast<scalar_t>(v));
+        atomicAdd(cols + col, static_cast<scalar_t>(v));
+    }
+}
+
+__device__ __forceinline__ double axis_block_sum_local(double value, double* shared) {
+    const int tid = threadIdx.x;
+    shared[tid] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+template <typename scalar_t>
+__global__ void axis_metric_global_kernel(const scalar_t* rows, int64_t row_count, int64_t col_count, double* global_mean) {
+    double local = 0.0;
+    for (int64_t row = threadIdx.x; row < row_count; row += blockDim.x) {
+        local += static_cast<double>(rows[row]);
+    }
+    extern __shared__ double shared[];
+    const double total = axis_block_sum_local(local, shared);
+    if (threadIdx.x == 0) {
+        global_mean[0] = total / static_cast<double>(row_count * col_count);
+    }
+}
+
+template <typename scalar_t>
+__global__ void axis_metric_gather_kernel(
+    const scalar_t* rows,
+    const scalar_t* cols,
+    const double* global_mean,
+    scalar_t* out,
+    int64_t row_count,
+    int64_t col_count,
+    double power,
+    double coupling,
+    double eps) {
+    const int64_t n = row_count * col_count;
+    const double g = global_mean[0] < eps ? eps : global_mean[0];
+    const double coeff = coupling / (2.0 * power);
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t row = i / col_count;
+        const int64_t col = i - row * col_count;
+        double row_norm = (static_cast<double>(rows[row]) / static_cast<double>(col_count)) / g;
+        double col_norm = (static_cast<double>(cols[col]) / static_cast<double>(row_count)) / g;
+        row_norm = row_norm < eps ? eps : row_norm;
+        col_norm = col_norm < eps ? eps : col_norm;
+        double metric = exp(coeff * (log(row_norm) + log(col_norm)));
+        metric = metric < 0.08 ? 0.08 : (metric > 12.0 ? 12.0 : metric);
+        out[i] = static_cast<scalar_t>(metric);
+    }
+}
+
+}  // namespace
+
+torch::Tensor instant_axis_metric_2d_cuda(torch::Tensor rel, double power, double coupling, double eps) {
+    TORCH_CHECK(rel.is_cuda(), "rel must be CUDA");
+    TORCH_CHECK(rel.dim() == 2, "instant_axis_metric_2d requires a 2D tensor");
+    TORCH_CHECK(rel.scalar_type() == at::kFloat || rel.scalar_type() == at::kDouble, "rel must be float32 or float64");
+    const c10::cuda::CUDAGuard device_guard(rel.device());
+    auto rel_c = rel.contiguous();
+    const int64_t rows_n = rel_c.size(0);
+    const int64_t cols_n = rel_c.size(1);
+    power = std::max(power, 0.25);
+    auto rows = torch::empty({rows_n}, rel_c.options());
+    auto cols = torch::empty({cols_n}, rel_c.options());
+    auto global = torch::empty({1}, rel_c.options().dtype(torch::kFloat64));
+    auto out = torch::empty_like(rel_c);
+    const int reset_blocks = std::min<int64_t>(1024, std::max<int64_t>(1, (rows_n + cols_n + kThreads - 1) / kThreads));
+    const int value_blocks = std::min<int64_t>(65535, std::max<int64_t>(1, (rel_c.numel() + kThreads - 1) / kThreads));
+    AT_DISPATCH_FLOATING_TYPES(rel_c.scalar_type(), "instant_axis_metric_2d_cuda", [&] {
+        axis_metric_reset_kernel<scalar_t><<<reset_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            rows.data_ptr<scalar_t>(),
+            cols.data_ptr<scalar_t>(),
+            rows_n,
+            cols_n);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        axis_metric_sum_kernel<scalar_t><<<value_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            rel_c.data_ptr<scalar_t>(),
+            rows.data_ptr<scalar_t>(),
+            cols.data_ptr<scalar_t>(),
+            rows_n,
+            cols_n,
+            power,
+            eps);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        axis_metric_global_kernel<scalar_t><<<1, kThreads, kThreads * sizeof(double), at::cuda::getCurrentCUDAStream()>>>(
+            rows.data_ptr<scalar_t>(),
+            rows_n,
+            cols_n,
+            global.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        axis_metric_gather_kernel<scalar_t><<<value_blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            rows.data_ptr<scalar_t>(),
+            cols.data_ptr<scalar_t>(),
+            global.data_ptr<double>(),
+            out.data_ptr<scalar_t>(),
+            rows_n,
+            cols_n,
+            power,
+            coupling,
+            eps);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 void metric_update_cuda(
     torch::Tensor metric_cos,
     torch::Tensor metric_sin,
@@ -1383,6 +1747,560 @@ void contact_update_pair_cuda(
             contact_gain,
             restoring,
             cubic);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+namespace {
+
+__device__ __forceinline__ void reduce6_local(double* shared, double v0, double v1, double v2, double v3, double v4, double v5) {
+    const int tid = threadIdx.x;
+    double* s0 = shared;
+    double* s1 = shared + blockDim.x;
+    double* s2 = shared + 2 * blockDim.x;
+    double* s3 = shared + 3 * blockDim.x;
+    double* s4 = shared + 4 * blockDim.x;
+    double* s5 = shared + 5 * blockDim.x;
+    s0[tid] = v0;
+    s1[tid] = v1;
+    s2[tid] = v2;
+    s3[tid] = v3;
+    s4[tid] = v4;
+    s5[tid] = v5;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s0[tid] += s0[tid + stride];
+            s1[tid] += s1[tid + stride];
+            s2[tid] += s2[tid + stride];
+            s3[tid] += s3[tid + stride];
+            s4[tid] += s4[tid + stride];
+            s5[tid] += s5[tid + stride];
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ double block_sum_local(double value, double* shared) {
+    const int tid = threadIdx.x;
+    shared[tid] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+template <typename scalar_t>
+__global__ void drive_stats_partial_kernel(
+    const scalar_t* tangent,
+    const scalar_t* pred,
+    const scalar_t* error,
+    int64_t n,
+    int chunks,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    double tf2 = 0.0;
+    double pred2 = 0.0;
+    double dot = 0.0;
+    double rational2 = 0.0;
+    double root2 = 0.0;
+    double error2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double p = static_cast<double>(pred[i]);
+        const double e = static_cast<double>(error[i]);
+        const double rational = t / (1.0 + fabs(t) / clip);
+        const double root_raw = (t < 0.0 ? -1.0 : (t > 0.0 ? 1.0 : 0.0)) * sqrt(fmin(fabs(t), clip * clip) + eps);
+        tf2 += t * t;
+        pred2 += p * p;
+        dot += t * p;
+        rational2 += rational * rational;
+        root2 += root_raw * root_raw;
+        error2 += e * e;
+    }
+    extern __shared__ double shared6[];
+    reduce6_local(shared6, tf2, pred2, dot, rational2, root2, error2);
+    if (threadIdx.x == 0) {
+        double* row = partial + static_cast<int64_t>(chunk) * 6;
+        row[0] = shared6[0];
+        row[1] = shared6[blockDim.x];
+        row[2] = shared6[2 * blockDim.x];
+        row[3] = shared6[3 * blockDim.x];
+        row[4] = shared6[4 * blockDim.x];
+        row[5] = shared6[5 * blockDim.x];
+    }
+}
+
+template <typename scalar_t>
+__global__ void drive_stats_finalize_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    const scalar_t* surprise,
+    double prediction_mix,
+    int64_t warmup_steps,
+    int64_t step,
+    double eps,
+    double* stats) {
+    double sums[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        const double* row = partial + static_cast<int64_t>(chunk) * 6;
+        sums[0] += row[0];
+        sums[1] += row[1];
+        sums[2] += row[2];
+        sums[3] += row[3];
+        sums[4] += row[4];
+        sums[5] += row[5];
+    }
+    extern __shared__ double shared6[];
+    reduce6_local(shared6, sums[0], sums[1], sums[2], sums[3], sums[4], sums[5]);
+    if (threadIdx.x == 0) {
+        const double inv_n = 1.0 / static_cast<double>(n);
+        const double force_rms = sqrt(shared6[0] * inv_n + eps);
+        const double pred_rms = sqrt(shared6[blockDim.x] * inv_n + eps);
+        const double rational_rms = sqrt(shared6[3 * blockDim.x] * inv_n + eps);
+        const double root_rms = sqrt(shared6[4 * blockDim.x] * inv_n + eps);
+        const double error_rms = sqrt(shared6[5 * blockDim.x] * inv_n + eps);
+        double align_gate = 0.0;
+        if (pred_rms > sqrt(eps)) {
+            const double alignment = fmin(1.0, fmax(-1.0, (shared6[2 * blockDim.x] * inv_n) / (force_rms * pred_rms + eps)));
+            align_gate = fmin(1.0, fmax(0.0, (alignment + 1.0) * 0.5));
+        }
+        const double warmup = warmup_steps == 0 ? 1.0 : (1.0 - exp(-static_cast<double>(step) / fmax(1.0, static_cast<double>(warmup_steps))));
+        const double surprise_value = static_cast<double>(surprise[0]);
+        const double mix = prediction_mix * warmup * align_gate / (1.0 + surprise_value);
+        stats[0] = force_rms;
+        stats[1] = pred_rms;
+        stats[2] = rational_rms;
+        stats[3] = root_rms;
+        stats[4] = error_rms;
+        stats[5] = mix;
+        stats[6] = surprise_value;
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ double shaped_value_device(
+    double t,
+    const double* stats,
+    double root_channel_mix,
+    double spike_mix,
+    bool hard_enabled,
+    double clip,
+    double eps) {
+    const double rational = t / (1.0 + fabs(t) / clip);
+    const double bounded = tanh(t / clip) * clip;
+    const double root_raw = (t < 0.0 ? -1.0 : (t > 0.0 ? 1.0 : 0.0)) * sqrt(fmin(fabs(t), clip * clip) + eps);
+    const double root = root_raw * (stats[2] / fmax(stats[3], eps));
+    const double surprise = stats[6];
+    const double spike = spike_mix / (1.0 + surprise);
+    const double base = (1.0 - spike) * rational + spike * bounded;
+    const double root_mix = hard_enabled ? root_channel_mix / (1.0 + 0.5 * surprise) : 0.0;
+    return (1.0 - root_mix) * base + root_mix * root;
+}
+
+template <typename scalar_t>
+__global__ void shaped_stats_partial_kernel(
+    const scalar_t* tangent,
+    const scalar_t* echo,
+    const scalar_t* hash_pred,
+    bool has_echo,
+    bool has_hash_pred,
+    bool hard_enabled,
+    int64_t n,
+    int chunks,
+    const double* stats,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    double shaped2 = 0.0;
+    double echo2 = 0.0;
+    double hash2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double shaped = shaped_value_device<scalar_t>(
+            static_cast<double>(tangent[i]), stats, root_channel_mix, spike_mix, hard_enabled, clip, eps);
+        shaped2 += shaped * shaped;
+        if (has_echo) {
+            const double v = static_cast<double>(echo[i]);
+            echo2 += v * v;
+        }
+        if (has_hash_pred) {
+            const double v = static_cast<double>(hash_pred[i]);
+            hash2 += v * v;
+        }
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, shaped2, echo2, hash2, 0.0);
+    if (threadIdx.x == 0) {
+        double* row = partial + static_cast<int64_t>(chunk) * 3;
+        row[0] = shared[0];
+        row[1] = shared[blockDim.x];
+        row[2] = shared[2 * blockDim.x];
+    }
+}
+
+__global__ void shaped_stats_finalize_kernel(const double* partial, int chunks, int64_t n, double eps, double* stats) {
+    double shaped = 0.0;
+    double echo = 0.0;
+    double hash = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        const double* row = partial + static_cast<int64_t>(chunk) * 3;
+        shaped += row[0];
+        echo += row[1];
+        hash += row[2];
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, shaped, echo, hash, 0.0);
+    if (threadIdx.x == 0) {
+        const double inv_n = 1.0 / static_cast<double>(n);
+        stats[7] = sqrt(shared[0] * inv_n + eps);
+        stats[8] = sqrt(shared[blockDim.x] * inv_n + eps);
+        stats[9] = sqrt(shared[2 * blockDim.x] * inv_n + eps);
+    }
+}
+
+template <typename scalar_t>
+__global__ void core_stats_partial_kernel(
+    const scalar_t* tangent,
+    bool hard_enabled,
+    int64_t n,
+    int chunks,
+    const double* stats,
+    double direct_force_mix,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    double core2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double shaped = shaped_value_device<scalar_t>(t, stats, root_channel_mix, spike_mix, hard_enabled, clip, eps);
+        const double direct_mix = direct_force_mix / (1.0 + 0.35 * stats[6]);
+        const double direct = t * (stats[7] / fmax(stats[0], eps));
+        const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
+        core2 += core * core;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(core2, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+__global__ void core_stats_finalize_kernel(const double* partial, int chunks, int64_t n, double eps, double* stats) {
+    double sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        sum += partial[chunk];
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        stats[10] = sqrt(total / static_cast<double>(n) + eps);
+    }
+}
+
+template <typename scalar_t>
+__global__ void drive_partial_kernel(
+    const scalar_t* tangent,
+    const scalar_t* pred,
+    const scalar_t* error,
+    const scalar_t* echo,
+    const scalar_t* hash_pred,
+    scalar_t* drive,
+    bool has_echo,
+    bool has_hash_pred,
+    bool hard_enabled,
+    int64_t n,
+    int chunks,
+    const double* stats,
+    double novelty_mix,
+    double echo_mix,
+    double hash_drive_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    double drive2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double e = static_cast<double>(error[i]);
+        const double shaped = shaped_value_device<scalar_t>(t, stats, root_channel_mix, spike_mix, hard_enabled, clip, eps);
+        const double direct_mix = direct_force_mix / (1.0 + 0.35 * stats[6]);
+        const double direct = t * (stats[7] / fmax(stats[0], eps));
+        const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
+        const double residual_mix = residual_feedback_mix / (1.0 + stats[6]);
+        const double residual = e * (stats[10] / fmax(stats[4], eps));
+        const double novelty = tanh(e / (clip * (1.0 + stats[6]))) * clip;
+        double d = (1.0 - stats[5]) * core + stats[5] * static_cast<double>(pred[i]) + novelty_mix * novelty +
+                   residual_mix * residual;
+        if (hard_enabled && has_echo) {
+            d += echo_mix * static_cast<double>(echo[i]) * (stats[7] / fmax(stats[8], eps));
+        }
+        if (hard_enabled && has_hash_pred) {
+            d += hash_drive_mix * static_cast<double>(hash_pred[i]) * (stats[7] / fmax(stats[9], eps));
+        }
+        drive[i] = static_cast<scalar_t>(d);
+        drive2 += d * d;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(drive2, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+template <typename scalar_t>
+__global__ void drive_gain_update_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    int64_t step,
+    scalar_t* drive_energy,
+    double reservoir_decay,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double eps,
+    double* gain_out) {
+    double sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        sum += partial[chunk];
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        const double now = total / static_cast<double>(n);
+        const double updated = step <= 1 ? now : static_cast<double>(*drive_energy) * reservoir_decay + now * (1.0 - reservoir_decay);
+        *drive_energy = static_cast<scalar_t>(updated);
+        double gain = target_update_rms / sqrt(updated + eps);
+        gain = gain < min_gain ? min_gain : (gain > max_gain ? max_gain : gain);
+        gain_out[0] = gain;
+    }
+}
+
+template <typename scalar_t>
+__global__ void param_apply_drive_kernel(scalar_t* param, const scalar_t* drive, const double* gain, int64_t n, double lr) {
+    const double g = gain[0];
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        param[i] = static_cast<scalar_t>(static_cast<double>(param[i]) - lr * static_cast<double>(drive[i]) * g);
+    }
+}
+
+}  // namespace
+
+void drive_update_cuda(
+    torch::Tensor param,
+    torch::Tensor tangent_force,
+    torch::Tensor pred,
+    torch::Tensor error,
+    torch::Tensor echo,
+    torch::Tensor hash_pred,
+    torch::Tensor surprise,
+    torch::Tensor drive_energy,
+    int64_t step,
+    bool hard_enabled,
+    double lr,
+    double reservoir_decay,
+    double prediction_mix,
+    double novelty_mix,
+    double echo_mix,
+    double hash_drive_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double root_channel_mix,
+    double spike_mix,
+    int64_t warmup_steps,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double drive_clip,
+    double eps) {
+    TORCH_CHECK(param.is_cuda() && tangent_force.is_cuda() && pred.is_cuda() && error.is_cuda(), "drive_update tensors must be CUDA");
+    TORCH_CHECK(param.is_contiguous() && tangent_force.is_contiguous() && pred.is_contiguous() && error.is_contiguous(), "drive_update requires contiguous tensors");
+    TORCH_CHECK(param.scalar_type() == tangent_force.scalar_type() && pred.scalar_type() == tangent_force.scalar_type() &&
+                    error.scalar_type() == tangent_force.scalar_type(),
+                "drive_update dtype mismatch");
+    TORCH_CHECK(param.scalar_type() == at::kFloat || param.scalar_type() == at::kDouble, "drive_update supports float32 and float64 params");
+    TORCH_CHECK(param.numel() == tangent_force.numel() && pred.numel() == tangent_force.numel() && error.numel() == tangent_force.numel(),
+                "drive_update numel mismatch");
+    TORCH_CHECK(surprise.is_cuda() && surprise.dim() == 0 && drive_energy.is_cuda() && drive_energy.dim() == 0, "drive_update scalar state must be CUDA scalars");
+    TORCH_CHECK(surprise.scalar_type() == tangent_force.scalar_type() && drive_energy.scalar_type() == tangent_force.scalar_type(),
+                "drive_update scalar state dtype mismatch");
+    const bool has_echo = echo.numel() > 0;
+    const bool has_hash_pred = hash_pred.numel() > 0;
+    if (has_echo) {
+        TORCH_CHECK(echo.is_cuda() && echo.is_contiguous() && echo.numel() == tangent_force.numel() &&
+                        echo.scalar_type() == tangent_force.scalar_type(),
+                    "echo shape/dtype mismatch");
+    }
+    if (has_hash_pred) {
+        TORCH_CHECK(hash_pred.is_cuda() && hash_pred.is_contiguous() && hash_pred.numel() == tangent_force.numel() &&
+                        hash_pred.scalar_type() == tangent_force.scalar_type(),
+                    "hash_pred shape/dtype mismatch");
+    }
+    const c10::cuda::CUDAGuard device_guard(param.device());
+    const int64_t n = tangent_force.numel();
+    const int chunks = choose_chunks(n);
+    const int blocks = std::min<int64_t>(65535, std::max<int64_t>(1, (n + kThreads - 1) / kThreads));
+    auto partial6 = torch::empty({chunks, 6}, tangent_force.options().dtype(torch::kFloat64));
+    auto partial3 = torch::empty({chunks, 3}, tangent_force.options().dtype(torch::kFloat64));
+    auto partial1 = torch::empty({chunks}, tangent_force.options().dtype(torch::kFloat64));
+    auto stats = torch::empty({11}, tangent_force.options().dtype(torch::kFloat64));
+    auto gain = torch::empty({1}, tangent_force.options().dtype(torch::kFloat64));
+    auto drive = torch::empty_like(tangent_force);
+    auto empty = tangent_force;
+    AT_DISPATCH_FLOATING_TYPES(tangent_force.scalar_type(), "drive_update_cuda", [&] {
+        drive_stats_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            6 * kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            tangent_force.data_ptr<scalar_t>(),
+            pred.data_ptr<scalar_t>(),
+            error.data_ptr<scalar_t>(),
+            n,
+            chunks,
+            drive_clip,
+            eps,
+            partial6.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        drive_stats_finalize_kernel<scalar_t><<<
+            1,
+            kThreads,
+            6 * kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            partial6.data_ptr<double>(),
+            chunks,
+            n,
+            surprise.data_ptr<scalar_t>(),
+            prediction_mix,
+            warmup_steps,
+            step,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        shaped_stats_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            4 * kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            tangent_force.data_ptr<scalar_t>(),
+            has_echo ? echo.data_ptr<scalar_t>() : empty.data_ptr<scalar_t>(),
+            has_hash_pred ? hash_pred.data_ptr<scalar_t>() : empty.data_ptr<scalar_t>(),
+            has_echo,
+            has_hash_pred,
+            hard_enabled,
+            n,
+            chunks,
+            stats.data_ptr<double>(),
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial3.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        shaped_stats_finalize_kernel<<<
+            1,
+            kThreads,
+            4 * kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            partial3.data_ptr<double>(),
+            chunks,
+            n,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        core_stats_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            tangent_force.data_ptr<scalar_t>(),
+            hard_enabled,
+            n,
+            chunks,
+            stats.data_ptr<double>(),
+            direct_force_mix,
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        core_stats_finalize_kernel<<<1, kThreads, kThreads * sizeof(double), at::cuda::getCurrentCUDAStream()>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        drive_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            kThreads * sizeof(double),
+            at::cuda::getCurrentCUDAStream()>>>(
+            tangent_force.data_ptr<scalar_t>(),
+            pred.data_ptr<scalar_t>(),
+            error.data_ptr<scalar_t>(),
+            has_echo ? echo.data_ptr<scalar_t>() : empty.data_ptr<scalar_t>(),
+            has_hash_pred ? hash_pred.data_ptr<scalar_t>() : empty.data_ptr<scalar_t>(),
+            drive.data_ptr<scalar_t>(),
+            has_echo,
+            has_hash_pred,
+            hard_enabled,
+            n,
+            chunks,
+            stats.data_ptr<double>(),
+            novelty_mix,
+            echo_mix,
+            hash_drive_mix,
+            direct_force_mix,
+            residual_feedback_mix,
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        drive_gain_update_kernel<scalar_t><<<1, kThreads, kThreads * sizeof(double), at::cuda::getCurrentCUDAStream()>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            step,
+            drive_energy.data_ptr<scalar_t>(),
+            reservoir_decay,
+            target_update_rms,
+            min_gain,
+            max_gain,
+            eps,
+            gain.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        param_apply_drive_kernel<scalar_t><<<blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            param.data_ptr<scalar_t>(),
+            drive.data_ptr<scalar_t>(),
+            gain.data_ptr<double>(),
+            n,
+            lr);
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

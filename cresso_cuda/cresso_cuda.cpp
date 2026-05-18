@@ -41,6 +41,26 @@ torch::Tensor basis_reconstruct_with_cache_cuda(
     torch::Tensor axis_cache);
 torch::Tensor hash_reduce_mean_cuda(torch::Tensor x, int64_t bins, int64_t salt);
 torch::Tensor hash_gather_cuda(torch::Tensor values, std::vector<int64_t> sizes, int64_t salt);
+torch::Tensor hash_metric_update_log_cuda(
+    torch::Tensor density_source,
+    torch::Tensor hash_energy,
+    std::vector<int64_t> sizes,
+    int64_t salt,
+    int64_t step,
+    double hash_decay,
+    double hash_metric_coupling,
+    double energy_power,
+    double eps);
+torch::Tensor hash_impulse_update_gather_cuda(
+    torch::Tensor port_source,
+    torch::Tensor hash_refractory,
+    torch::Tensor hash_impulse,
+    std::vector<int64_t> sizes,
+    int64_t salt,
+    double hash_decay,
+    double hash_impulse_decay,
+    double refractory_gain);
+torch::Tensor instant_axis_metric_2d_cuda(torch::Tensor rel, double power, double coupling, double eps);
 void metric_update_cuda(
     torch::Tensor metric_cos,
     torch::Tensor metric_sin,
@@ -76,6 +96,33 @@ void contact_update_pair_cuda(
     double contact_gain,
     double restoring,
     double cubic);
+void drive_update_cuda(
+    torch::Tensor param,
+    torch::Tensor tangent_force,
+    torch::Tensor pred,
+    torch::Tensor error,
+    torch::Tensor echo,
+    torch::Tensor hash_pred,
+    torch::Tensor surprise,
+    torch::Tensor drive_energy,
+    int64_t step,
+    bool hard_enabled,
+    double lr,
+    double reservoir_decay,
+    double prediction_mix,
+    double novelty_mix,
+    double echo_mix,
+    double hash_drive_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double root_channel_mix,
+    double spike_mix,
+    int64_t warmup_steps,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double drive_clip,
+    double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("basis_stats", &basis_stats_cuda, "CRESSO5 basis normalization stats (CUDA)");
@@ -95,7 +142,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "CRESSO5 fused basis reconstruction with axis cache (CUDA)");
     m.def("hash_reduce_mean", &hash_reduce_mean_cuda, "CRESSO5 coordinate hash reduce mean (CUDA)");
     m.def("hash_gather", &hash_gather_cuda, "CRESSO5 coordinate hash gather (CUDA)");
+    m.def("hash_metric_update_log", &hash_metric_update_log_cuda, "CRESSO5 fused hash metric update and log gather (CUDA)");
+    m.def("hash_impulse_update_gather", &hash_impulse_update_gather_cuda, "CRESSO5 fused hash impulse update and gather (CUDA)");
+    m.def("instant_axis_metric_2d", &instant_axis_metric_2d_cuda, "CRESSO5 fused 2D instant axial metric (CUDA)");
     m.def("metric_update", &metric_update_cuda, "CRESSO5 fused rank metric oscillator update (CUDA)");
     m.def("confidence_update", &confidence_update_cuda, "CRESSO5 fused rank confidence update (CUDA)");
     m.def("contact_update_pair", &contact_update_pair_cuda, "CRESSO5 fused rank contact oscillator update (CUDA)");
+    m.def("drive_update", &drive_update_cuda, "CRESSO5 fused dense drive and parameter update (CUDA)");
 }

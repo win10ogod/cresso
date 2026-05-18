@@ -911,6 +911,7 @@ class CRESSO5(Optimizer):
         hash_pred = 0.0
         bins = int(group["hash_bins"])
         tables = int(group.get("hash_tables", 1))
+        density_source: Tensor | None = None
         if hard_enabled and bins > 0 and "hash_energy" in state:
             cuda_mode = str(group.get("cuda_ops", "auto"))
             hash_cuda_ops = None
@@ -928,33 +929,54 @@ class CRESSO5(Optimizer):
                 hash_salts = []
             log_hash_metric: Tensor | None = None
             h_energy_all: Tensor = state["hash_energy"]
+            density_source = rel.pow(float(group["energy_power"]))
             for table in range(tables):
-                density_source = rel.pow(float(group["energy_power"]))
                 if hash_cuda_ops is None:
                     hash_idx_t = _hash_index_tensor(tuple(param.shape), bins, param.device, salt=table)
                     assert hash_indices is not None
                     hash_indices.append(hash_idx_t)
                     cell_density = _hash_reduce_mean(density_source, hash_idx_t, bins)
+                    h_energy = h_energy_all[table]
+                    if step <= 1:
+                        h_energy.copy_(cell_density.to(h_energy.dtype))
+                    else:
+                        h_energy.mul_(float(group["hash_decay"])).add_(cell_density.to(h_energy.dtype), alpha=1.0 - float(group["hash_decay"]))
+                    hm = (h_energy.to(dtype) / h_energy.to(dtype).mean().clamp_min(eps)).clamp_min(eps)
+                    hm_pow = hm.pow(float(group["hash_metric_coupling"]) / max(0.25, float(group["energy_power"])))
+                    hmt = hm_pow[hash_idx_t].clamp(0.08, 12.0)
+                    term = torch.log(hmt.clamp_min(eps))
                 else:
                     assert hash_salts is not None
                     hash_salts.append(table)
-                    cell_density = hash_cuda_ops.hash_reduce_mean(density_source.contiguous(), bins, table)
-                h_energy = h_energy_all[table]
-                if step <= 1:
-                    h_energy.copy_(cell_density.to(h_energy.dtype))
-                else:
-                    h_energy.mul_(float(group["hash_decay"])).add_(cell_density.to(h_energy.dtype), alpha=1.0 - float(group["hash_decay"]))
-                hm = (h_energy.to(dtype) / h_energy.to(dtype).mean().clamp_min(eps)).clamp_min(eps)
-                hm_pow = hm.pow(float(group["hash_metric_coupling"]) / max(0.25, float(group["energy_power"])))
-                if hash_cuda_ops is None:
-                    hmt = hm_pow[hash_idx_t].clamp(0.08, 12.0)
-                else:
-                    hmt = hash_cuda_ops.hash_gather(hm_pow.contiguous(), [int(d) for d in param.shape], table).clamp(0.08, 12.0)
-                term = torch.log(hmt.clamp_min(eps))
+                    h_energy = h_energy_all[table]
+                    if hasattr(hash_cuda_ops, "hash_metric_update_log") and h_energy.dtype == density_source.dtype:
+                        term = hash_cuda_ops.hash_metric_update_log(
+                            density_source.contiguous(),
+                            h_energy,
+                            [int(d) for d in param.shape],
+                            table,
+                            step,
+                            float(group["hash_decay"]),
+                            float(group["hash_metric_coupling"]),
+                            float(group["energy_power"]),
+                            eps,
+                        )
+                    else:
+                        cell_density = hash_cuda_ops.hash_reduce_mean(density_source.contiguous(), bins, table)
+                        if step <= 1:
+                            h_energy.copy_(cell_density.to(h_energy.dtype))
+                        else:
+                            h_energy.mul_(float(group["hash_decay"])).add_(cell_density.to(h_energy.dtype), alpha=1.0 - float(group["hash_decay"]))
+                        hm = (h_energy.to(dtype) / h_energy.to(dtype).mean().clamp_min(eps)).clamp_min(eps)
+                        hm_pow = hm.pow(float(group["hash_metric_coupling"]) / max(0.25, float(group["energy_power"])))
+                        hmt = hash_cuda_ops.hash_gather(hm_pow.contiguous(), [int(d) for d in param.shape], table).clamp(0.08, 12.0)
+                        term = torch.log(hmt.clamp_min(eps))
                 log_hash_metric = term if log_hash_metric is None else log_hash_metric + term
             assert log_hash_metric is not None
             hash_metric = torch.exp(log_hash_metric / float(tables)).clamp(0.08, 12.0)
-        density = torch.log1p(rel.pow(float(group["energy_power"])))
+        if density_source is None:
+            density_source = rel.pow(float(group["energy_power"]))
+        density = torch.log1p(density_source)
         density = density / density.mean().clamp_min(eps) - 1.0
         mcos_port, msin_port = _project_step(density, freqs, rank, basis_pairs)
         mcos_port = mcos_port.to(state["metric_cos"].dtype)
@@ -997,12 +1019,27 @@ class CRESSO5(Optimizer):
             local_metric = (1.0 + local_sharp * torch.sqrt(rel.clamp(max=100.0))).clamp(1.0, 8.0)
         else:
             local_metric = 1.0
-        instant_metric = _instant_axis_metric(
-            rel,
-            float(group["instant_metric_power"]),
-            float(group["instant_metric_coupling"]) if hard_enabled else 0.0,
-            eps,
-        )
+        instant_coupling = float(group["instant_metric_coupling"]) if hard_enabled else 0.0
+        if (
+            isinstance(basis_pairs, _CudaBasisCache)
+            and hasattr(basis_pairs.ops, "instant_axis_metric_2d")
+            and rel.ndim == 2
+            and instant_coupling != 0.0
+            and rel.dtype in (torch.float32, torch.float64)
+        ):
+            instant_metric = basis_pairs.ops.instant_axis_metric_2d(
+                rel.contiguous(),
+                float(group["instant_metric_power"]),
+                instant_coupling,
+                eps,
+            )
+        else:
+            instant_metric = _instant_axis_metric(
+                rel,
+                float(group["instant_metric_power"]),
+                instant_coupling,
+                eps,
+            )
         tangent_force = (force / (scale * metric * local_metric * instant_metric * hash_metric + eps)).clamp(-1.0e4, 1.0e4)
 
         qcos: Tensor = state["q_cos"]
@@ -1036,17 +1073,32 @@ class CRESSO5(Optimizer):
                 if hash_cuda_ops is None:
                     assert hash_idx_t is not None
                     cell_port = _hash_reduce_mean(port_source, hash_idx_t, bins).to(h_imp_all.dtype)
-                else:
-                    cell_port = hash_cuda_ops.hash_reduce_mean(port_source.contiguous(), bins, table).to(h_imp_all.dtype)
-                h_ref = h_ref_all[table]
-                h_imp = h_imp_all[table]
-                h_ref.mul_(float(group["hash_decay"])).add_(cell_port.abs(), alpha=1.0 - float(group["hash_decay"]))
-                h_gate = 1.0 / (1.0 + float(group["refractory_gain"]) * h_ref)
-                h_imp.mul_(float(group["hash_impulse_decay"])).add_(cell_port * h_gate, alpha=1.0 - float(group["hash_impulse_decay"]))
-                if hash_cuda_ops is None:
+                    h_ref = h_ref_all[table]
+                    h_imp = h_imp_all[table]
+                    h_ref.mul_(float(group["hash_decay"])).add_(cell_port.abs(), alpha=1.0 - float(group["hash_decay"]))
+                    h_gate = 1.0 / (1.0 + float(group["refractory_gain"]) * h_ref)
+                    h_imp.mul_(float(group["hash_impulse_decay"])).add_(cell_port * h_gate, alpha=1.0 - float(group["hash_impulse_decay"]))
                     retrieved = h_imp.to(dtype)[hash_idx_t]
                 else:
-                    retrieved = hash_cuda_ops.hash_gather(h_imp.to(dtype).contiguous(), [int(d) for d in param.shape], table)
+                    h_ref = h_ref_all[table]
+                    h_imp = h_imp_all[table]
+                    if hasattr(hash_cuda_ops, "hash_impulse_update_gather") and h_ref.dtype == port_source.dtype and h_imp.dtype == port_source.dtype:
+                        retrieved = hash_cuda_ops.hash_impulse_update_gather(
+                            port_source.contiguous(),
+                            h_ref,
+                            h_imp,
+                            [int(d) for d in param.shape],
+                            table,
+                            float(group["hash_decay"]),
+                            float(group["hash_impulse_decay"]),
+                            float(group["refractory_gain"]),
+                        )
+                    else:
+                        cell_port = hash_cuda_ops.hash_reduce_mean(port_source.contiguous(), bins, table).to(h_imp_all.dtype)
+                        h_ref.mul_(float(group["hash_decay"])).add_(cell_port.abs(), alpha=1.0 - float(group["hash_decay"]))
+                        h_gate = 1.0 / (1.0 + float(group["refractory_gain"]) * h_ref)
+                        h_imp.mul_(float(group["hash_impulse_decay"])).add_(cell_port * h_gate, alpha=1.0 - float(group["hash_impulse_decay"]))
+                        retrieved = hash_cuda_ops.hash_gather(h_imp.to(dtype).contiguous(), [int(d) for d in param.shape], table)
                 pred_acc = retrieved if pred_acc is None else pred_acc + retrieved
             assert pred_acc is not None
             hash_pred = pred_acc / float(len(hash_salts) if hash_salts is not None else len(hash_indices))
@@ -1120,6 +1172,53 @@ class CRESSO5(Optimizer):
         mode_gates = torch.sigmoid(float(group["confidence_gain"]) * conf).to(dtype)
         pred = _reconstruct_step(qcos.to(dtype), qsin.to(dtype), freqs, tuple(param.shape), dtype, gates=mode_gates, basis_pairs=basis_pairs)
         error = tangent_force - pred
+        echo_raw: Tensor | None = None
+        if hard_enabled and float(group["echo_mix"]) != 0.0:
+            echo_cos, echo_sin = _project_step(tangent_force, freqs, rank, basis_pairs)
+            echo_raw = _reconstruct_step(echo_cos, echo_sin, freqs, tuple(param.shape), dtype, basis_pairs=basis_pairs)
+
+        if (
+            isinstance(basis_pairs, _CudaBasisCache)
+            and hasattr(basis_pairs.ops, "drive_update")
+            and param.is_contiguous()
+            and tangent_force.is_contiguous()
+            and pred.is_contiguous()
+            and error.is_contiguous()
+            and param.dtype == dtype
+            and dtype in (torch.float32, torch.float64)
+            and state["surprise"].dtype == dtype
+            and state["drive_energy"].dtype == dtype
+        ):
+            empty_dense = torch.empty((0,), device=param.device, dtype=dtype)
+            basis_pairs.ops.drive_update(
+                param,
+                tangent_force.contiguous(),
+                pred.contiguous(),
+                error.contiguous(),
+                echo_raw.contiguous() if echo_raw is not None else empty_dense,
+                hash_pred.contiguous() if torch.is_tensor(hash_pred) else empty_dense,
+                state["surprise"],
+                state["drive_energy"],
+                step,
+                bool(hard_enabled),
+                float(group["lr"]),
+                float(group["reservoir_decay"]),
+                float(group["prediction_mix"]),
+                float(group["novelty_mix"]),
+                float(group["echo_mix"]),
+                float(group["hash_drive_mix"]),
+                float(group.get("direct_force_mix", 0.0)),
+                float(group.get("residual_feedback_mix", 0.0)),
+                float(group["root_channel_mix"]),
+                float(group["spike_mix"]),
+                int(group["warmup_steps"]),
+                float(group["target_update_rms"]),
+                float(group["min_gain"]),
+                float(group["max_gain"]),
+                float(group["drive_clip"]),
+                eps,
+            )
+            return
 
         force_rms = torch.sqrt(tangent_force.pow(2).mean() + eps)
         pred_rms = torch.sqrt(pred.pow(2).mean() + eps)
@@ -1146,9 +1245,8 @@ class CRESSO5(Optimizer):
         shaped_rms = torch.sqrt(shaped_force.pow(2).mean() + eps)
         novelty = torch.tanh(error / (clip * (1.0 + state["surprise"].to(dtype)))) * clip
         if hard_enabled and float(group["echo_mix"]) != 0.0:
-            echo_cos, echo_sin = _project_step(tangent_force, freqs, rank, basis_pairs)
-            echo = _reconstruct_step(echo_cos, echo_sin, freqs, tuple(param.shape), dtype, basis_pairs=basis_pairs)
-            echo = _rms_normalize(echo, shaped_rms, eps)
+            assert echo_raw is not None
+            echo = _rms_normalize(echo_raw, shaped_rms, eps)
         else:
             echo = 0.0
         if torch.is_tensor(hash_pred):

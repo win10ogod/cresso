@@ -43,9 +43,11 @@ CRESSO5 now includes fused CUDA C++ operators for the heavy pieces:
 - basis normalization stats,
 - basis projection,
 - basis reconstruction,
-- coordinate hash reduce-mean,
-- coordinate hash gather,
-- rank-state metric, confidence, and contact oscillator updates.
+- fused coordinate hash metric update and gather,
+- fused coordinate hash impulse update and gather,
+- fused 2D instant axial metric,
+- rank-state metric, confidence, and contact oscillator updates,
+- final dense drive shaping and parameter update.
 
 The CUDA workspace is rebuilt inside `step()`, shared transiently across same
 shape/rank tensors in that step, and is not stored in optimizer state or
@@ -65,7 +67,7 @@ Measured on an NVIDIA RTX PRO 6000 Blackwell Workstation Edition with PyTorch
 | --- | ---: | ---: | ---: |
 | Single tensor `(2048, 2048)`, rank=8 | 64.580 ms/step | 12.376 ms/step | 5.22x |
 | Single tensor `(4096, 4096)`, rank=8 | 97.635 ms/step | 34.411 ms/step | 2.84x |
-| 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=4 | 1554.304 ms/step | 145.385 ms/step | 10.69x |
+| 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=4 | 1491.470 ms/step | 69.669 ms/step | 21.41x |
 
 Actual speed depends on rank, tensor shape, hash settings, CUDA toolkit, GPU,
 and whether a workload is launch-bound or memory-bandwidth-bound.
