@@ -1123,3 +1123,266 @@ torch::Tensor hash_gather_cuda(torch::Tensor values, std::vector<int64_t> sizes,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+namespace {
+
+template <typename scalar_t>
+__global__ void metric_update_kernel(
+    scalar_t* metric_cos,
+    scalar_t* metric_sin,
+    scalar_t* metric_p_cos,
+    scalar_t* metric_p_sin,
+    const scalar_t* mcos_port,
+    const scalar_t* msin_port,
+    const scalar_t* omega,
+    int64_t rank,
+    double metric_dt,
+    double metric_friction) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rank) {
+        return;
+    }
+    const double damp = fmax(0.0, 1.0 - metric_dt * metric_friction);
+    const double w2 = static_cast<double>(omega[i]) * static_cast<double>(omega[i]);
+    double pc = static_cast<double>(metric_p_cos[i]) * damp;
+    pc += metric_dt * (static_cast<double>(mcos_port[i]) - w2 * static_cast<double>(metric_cos[i]));
+    metric_p_cos[i] = static_cast<scalar_t>(pc);
+    metric_cos[i] = static_cast<scalar_t>(fmin(3.0, fmax(-3.0, static_cast<double>(metric_cos[i]) + metric_dt * pc)));
+
+    double ps = static_cast<double>(metric_p_sin[i]) * damp;
+    ps += metric_dt * (static_cast<double>(msin_port[i]) - w2 * static_cast<double>(metric_sin[i]));
+    metric_p_sin[i] = static_cast<scalar_t>(ps);
+    metric_sin[i] = static_cast<scalar_t>(fmin(3.0, fmax(-3.0, static_cast<double>(metric_sin[i]) + metric_dt * ps)));
+}
+
+template <typename scalar_t>
+__global__ void confidence_update_kernel(
+    scalar_t* confidence,
+    const scalar_t* pcos_port,
+    const scalar_t* psin_port,
+    const scalar_t* qcos,
+    const scalar_t* qsin,
+    int64_t rank,
+    double confidence_decay,
+    double eps) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rank) {
+        return;
+    }
+    const double pc = static_cast<double>(pcos_port[i]);
+    const double ps = static_cast<double>(psin_port[i]);
+    const double qc = static_cast<double>(qcos[i]);
+    const double qs = static_cast<double>(qsin[i]);
+    const double port_energy = sqrt(pc * pc + ps * ps + eps);
+    const double q_energy = sqrt(qc * qc + qs * qs + eps);
+    double support = (pc * qc + ps * qs) / (port_energy * q_energy + eps);
+    support = fmin(1.0, fmax(-1.0, support));
+    const double updated = confidence_decay * static_cast<double>(confidence[i]) + (1.0 - confidence_decay) * support;
+    confidence[i] = static_cast<scalar_t>(fmin(4.0, fmax(-4.0, updated)));
+}
+
+template <typename scalar_t>
+__global__ void contact_update_pair_kernel(
+    scalar_t* q,
+    scalar_t* p,
+    const scalar_t* port,
+    const scalar_t* omega,
+    scalar_t* calcium,
+    scalar_t* action,
+    const scalar_t* surprise,
+    int64_t rank,
+    double dt,
+    double refractory_decay,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_brake,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic) {
+    extern __shared__ double shared[];
+    double* gated = shared;
+    double* reduce = shared + rank;
+    const int tid = threadIdx.x;
+    double energy_p = 0.0;
+    double energy_q = 0.0;
+    double port_power = 0.0;
+    const double s = static_cast<double>(*surprise);
+    const double plasticity = 1.0 + surprise_gain * s / (1.0 + s);
+    const double brake = 1.0 / (1.0 + surprise_brake * s);
+    for (int64_t i = tid; i < rank; i += blockDim.x) {
+        const double port_i = static_cast<double>(port[i]);
+        const double c = refractory_decay * static_cast<double>(calcium[i]) + (1.0 - refractory_decay) * fabs(port_i);
+        calcium[i] = static_cast<scalar_t>(c);
+        const double gate = 1.0 / (1.0 + refractory_gain * c);
+        const double gp = port_i * gate * plasticity * brake;
+        gated[i] = gp;
+        const double p_i = static_cast<double>(p[i]);
+        const double oq = static_cast<double>(omega[i]) * static_cast<double>(q[i]);
+        energy_p += p_i * p_i;
+        energy_q += oq * oq;
+        port_power += gp * p_i;
+    }
+    reduce[tid] = energy_p;
+    reduce[blockDim.x + tid] = energy_q;
+    reduce[2 * blockDim.x + tid] = port_power;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+            reduce[blockDim.x + tid] += reduce[blockDim.x + tid + stride];
+            reduce[2 * blockDim.x + tid] += reduce[2 * blockDim.x + tid + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ double damp;
+    if (tid == 0) {
+        const double inv_rank = rank > 0 ? 1.0 / static_cast<double>(rank) : 0.0;
+        const double energy = 0.5 * (reduce[0] * inv_rank + reduce[blockDim.x] * inv_rank);
+        const double power = reduce[2 * blockDim.x] * inv_rank;
+        const double action_value = 0.985 * static_cast<double>(*action) + dt * (power - energy);
+        *action = static_cast<scalar_t>(action_value);
+        const double friction = impulse_friction + contact_gain * tanh(fabs(action_value));
+        damp = fmax(0.0, 1.0 - dt * friction);
+    }
+    __syncthreads();
+    for (int64_t i = tid; i < rank; i += blockDim.x) {
+        const double w2 = static_cast<double>(omega[i]) * static_cast<double>(omega[i]);
+        double p_i = static_cast<double>(p[i]) * damp;
+        const double q_i = static_cast<double>(q[i]);
+        p_i += dt * (gated[i] - restoring * w2 * q_i - cubic * q_i * q_i * q_i);
+        double q_next = q_i + dt * p_i;
+        q_next = fmin(8.0, fmax(-8.0, q_next));
+        p[i] = static_cast<scalar_t>(p_i);
+        q[i] = static_cast<scalar_t>(q_next);
+    }
+}
+
+void check_rank_tensor(torch::Tensor t, int64_t rank, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.dim() == 1 && t.numel() == rank, name, " shape mismatch");
+    TORCH_CHECK(t.scalar_type() == at::kFloat || t.scalar_type() == at::kDouble, name, " must be float32 or float64");
+}
+
+}  // namespace
+
+void metric_update_cuda(
+    torch::Tensor metric_cos,
+    torch::Tensor metric_sin,
+    torch::Tensor metric_p_cos,
+    torch::Tensor metric_p_sin,
+    torch::Tensor mcos_port,
+    torch::Tensor msin_port,
+    torch::Tensor omega,
+    double metric_dt,
+    double metric_friction) {
+    const int64_t rank = metric_cos.numel();
+    check_rank_tensor(metric_cos, rank, "metric_cos");
+    check_rank_tensor(metric_sin, rank, "metric_sin");
+    check_rank_tensor(metric_p_cos, rank, "metric_p_cos");
+    check_rank_tensor(metric_p_sin, rank, "metric_p_sin");
+    check_rank_tensor(mcos_port, rank, "mcos_port");
+    check_rank_tensor(msin_port, rank, "msin_port");
+    check_rank_tensor(omega, rank, "omega");
+    TORCH_CHECK(metric_sin.scalar_type() == metric_cos.scalar_type(), "metric dtype mismatch");
+    const c10::cuda::CUDAGuard device_guard(metric_cos.device());
+    const int threads = 128;
+    const int blocks = std::max<int64_t>(1, (rank + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES(metric_cos.scalar_type(), "metric_update_cuda", [&] {
+        metric_update_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            metric_cos.data_ptr<scalar_t>(),
+            metric_sin.data_ptr<scalar_t>(),
+            metric_p_cos.data_ptr<scalar_t>(),
+            metric_p_sin.data_ptr<scalar_t>(),
+            mcos_port.data_ptr<scalar_t>(),
+            msin_port.data_ptr<scalar_t>(),
+            omega.data_ptr<scalar_t>(),
+            rank,
+            metric_dt,
+            metric_friction);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void confidence_update_cuda(
+    torch::Tensor confidence,
+    torch::Tensor pcos_port,
+    torch::Tensor psin_port,
+    torch::Tensor qcos,
+    torch::Tensor qsin,
+    double confidence_decay,
+    double eps) {
+    const int64_t rank = confidence.numel();
+    check_rank_tensor(confidence, rank, "confidence");
+    check_rank_tensor(pcos_port, rank, "pcos_port");
+    check_rank_tensor(psin_port, rank, "psin_port");
+    check_rank_tensor(qcos, rank, "qcos");
+    check_rank_tensor(qsin, rank, "qsin");
+    const c10::cuda::CUDAGuard device_guard(confidence.device());
+    const int threads = 128;
+    const int blocks = std::max<int64_t>(1, (rank + threads - 1) / threads);
+    AT_DISPATCH_FLOATING_TYPES(confidence.scalar_type(), "confidence_update_cuda", [&] {
+        confidence_update_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            confidence.data_ptr<scalar_t>(),
+            pcos_port.data_ptr<scalar_t>(),
+            psin_port.data_ptr<scalar_t>(),
+            qcos.data_ptr<scalar_t>(),
+            qsin.data_ptr<scalar_t>(),
+            rank,
+            confidence_decay,
+            eps);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void contact_update_pair_cuda(
+    torch::Tensor q,
+    torch::Tensor p,
+    torch::Tensor port,
+    torch::Tensor omega,
+    torch::Tensor calcium,
+    torch::Tensor action,
+    torch::Tensor surprise,
+    double dt,
+    double refractory_decay,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_brake,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic) {
+    const int64_t rank = q.numel();
+    check_rank_tensor(q, rank, "q");
+    check_rank_tensor(p, rank, "p");
+    check_rank_tensor(port, rank, "port");
+    check_rank_tensor(omega, rank, "omega");
+    check_rank_tensor(calcium, rank, "calcium");
+    TORCH_CHECK(action.is_cuda() && action.dim() == 0, "action must be a CUDA scalar");
+    TORCH_CHECK(surprise.is_cuda() && surprise.dim() == 0, "surprise must be a CUDA scalar");
+    TORCH_CHECK(rank <= 4096, "contact_update_pair supports rank <= 4096");
+    const c10::cuda::CUDAGuard device_guard(q.device());
+    const int threads = 128;
+    const size_t shared_bytes = static_cast<size_t>(rank + 3 * threads) * sizeof(double);
+    AT_DISPATCH_FLOATING_TYPES(q.scalar_type(), "contact_update_pair_cuda", [&] {
+        contact_update_pair_kernel<scalar_t><<<1, threads, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            q.data_ptr<scalar_t>(),
+            p.data_ptr<scalar_t>(),
+            port.data_ptr<scalar_t>(),
+            omega.data_ptr<scalar_t>(),
+            calcium.data_ptr<scalar_t>(),
+            action.data_ptr<scalar_t>(),
+            surprise.data_ptr<scalar_t>(),
+            rank,
+            dt,
+            refractory_decay,
+            refractory_gain,
+            surprise_gain,
+            surprise_brake,
+            impulse_friction,
+            contact_gain,
+            restoring,
+            cubic);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

@@ -372,6 +372,8 @@ def _basis_pairs_for_step(
     dtype: torch.dtype,
     cache_limit_elements: int,
     cuda_ops_mode: str = "auto",
+    transient_workspace: dict | None = None,
+    transient_key: tuple | None = None,
 ) -> list[Tuple[Tensor, Tensor]] | _CudaBasisCache | None:
     """Build a transient per-step basis cache when it is small enough."""
     n = 1
@@ -386,9 +388,16 @@ def _basis_pairs_for_step(
     ):
         ops = _load_cuda_ops(required=str(cuda_ops_mode) == "required")
         if ops is not None:
+            if transient_workspace is not None and transient_key is not None:
+                cached = transient_workspace.get(transient_key)
+                if cached is not None:
+                    return cached
             axis_cache = ops.basis_axis_cache(freqs, [int(d) for d in shape])
             stats = ops.basis_stats_with_cache(freqs, [int(d) for d in shape], axis_cache)
-            return _CudaBasisCache(ops, shape, stats, axis_cache)
+            result = _CudaBasisCache(ops, shape, stats, axis_cache)
+            if transient_workspace is not None and transient_key is not None:
+                transient_workspace[transient_key] = result
+            return result
     if int(cache_limit_elements) <= 0 or 2 * int(rank) * n > int(cache_limit_elements):
         return None
     return [_basis_pair(shape, freqs, r, dtype) for r in range(rank)]
@@ -749,6 +758,7 @@ class CRESSO5(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        transient_basis_workspace: dict = {}
         for group in self.param_groups:
             for param in group["params"]:
                 if param.grad is None or not torch.is_floating_point(param):
@@ -761,7 +771,7 @@ class CRESSO5(Optimizer):
                 if int(group.get("micro_field_max_size", 0)) > 0 and param.ndim > 0 and param.numel() <= int(group["micro_field_max_size"]):
                     self._micro_step(param, grad, group)
                 elif param.numel() >= group["min_spectral_size"] and group["rank"] > 0 and param.ndim > 0:
-                    self._spectral_step(param, grad, group)
+                    self._spectral_step(param, grad, group, transient_basis_workspace)
                 else:
                     self._scalar_step(param, grad, group)
         return loss
@@ -844,15 +854,15 @@ class CRESSO5(Optimizer):
         energy = 0.5 * (p.pow(2).mean() + ((omega * q).pow(2)).mean()) if rank > 0 else torch.zeros_like(action)
         port_power = (gated_port * p).mean() if rank > 0 else torch.zeros_like(action)
         action.mul_(0.985).add_((port_power - energy).to(action.dtype), alpha=dt)
-        friction = float(group["impulse_friction"]) + float(group["contact_gain"]) * torch.tanh(action.abs()).item()
+        friction = float(group["impulse_friction"]) + float(group["contact_gain"]) * torch.tanh(action.abs()).to(p.dtype)
 
-        p.mul_(max(0.0, 1.0 - dt * friction))
+        p.mul_(torch.clamp(1.0 - dt * friction, min=0.0))
         p.add_(gated_port - float(group["restoring"]) * (omega * omega) * q - float(group["cubic"]) * q.pow(3), alpha=dt)
         q.add_(p, alpha=dt)
         q.clamp_(-8.0, 8.0)
         return action
 
-    def _spectral_step(self, param: Tensor, grad: Tensor, group: dict) -> None:
+    def _spectral_step(self, param: Tensor, grad: Tensor, group: dict, transient_basis_workspace: dict | None = None) -> None:
         dtype = _work_dtype(param.dtype)
         state = self.state[param]
         if len(state) == 0:
@@ -877,6 +887,16 @@ class CRESSO5(Optimizer):
             dtype,
             int(group["basis_cache_limit_elements"]),
             str(group.get("cuda_ops", "auto")),
+            transient_basis_workspace,
+            (
+                param.device.type,
+                param.device.index,
+                tuple(int(d) for d in param.shape),
+                rank,
+                dtype,
+                int(group["max_frequency"]),
+                str(group.get("cuda_ops", "auto")),
+            ),
         )
         thin_cutoff = int(group["thin_matrix_hard_cutoff"])
         thin_matrix = param.ndim == 2 and thin_cutoff > 0 and min(param.shape) <= thin_cutoff
@@ -941,16 +961,29 @@ class CRESSO5(Optimizer):
         msin_port = msin_port.to(state["metric_sin"].dtype)
         mdt = float(group["metric_dt"])
         mf = float(group["metric_friction"])
-        for qname, pname, port in [
-            ("metric_cos", "metric_p_cos", mcos_port),
-            ("metric_sin", "metric_p_sin", msin_port),
-        ]:
-            mq: Tensor = state[qname]
-            mp: Tensor = state[pname]
-            mp.mul_(max(0.0, 1.0 - mdt * mf))
-            mp.add_(port - (omega * omega) * mq, alpha=mdt)
-            mq.add_(mp, alpha=mdt)
-            mq.clamp_(-3.0, 3.0)
+        if isinstance(basis_pairs, _CudaBasisCache) and hasattr(basis_pairs.ops, "metric_update"):
+            basis_pairs.ops.metric_update(
+                state["metric_cos"],
+                state["metric_sin"],
+                state["metric_p_cos"],
+                state["metric_p_sin"],
+                mcos_port.contiguous(),
+                msin_port.contiguous(),
+                omega.contiguous(),
+                mdt,
+                mf,
+            )
+        else:
+            for qname, pname, port in [
+                ("metric_cos", "metric_p_cos", mcos_port),
+                ("metric_sin", "metric_p_sin", msin_port),
+            ]:
+                mq: Tensor = state[qname]
+                mp: Tensor = state[pname]
+                mp.mul_(max(0.0, 1.0 - mdt * mf))
+                mp.add_(port - (omega * omega) * mq, alpha=mdt)
+                mq.add_(mp, alpha=mdt)
+                mq.clamp_(-3.0, 3.0)
 
         log_metric = _reconstruct_step(
             state["metric_cos"].to(dtype), state["metric_sin"].to(dtype), freqs, tuple(param.shape), dtype, basis_pairs=basis_pairs
@@ -1020,18 +1053,68 @@ class CRESSO5(Optimizer):
 
         # Mode confidence is a refractory reliability trace: modes receiving consistent nonzero
         # error become trusted; modes with noisy sign-inconsistent excitation are damped.
-        port_energy = torch.sqrt(pcos_port.pow(2) + psin_port.pow(2) + eps)
-        signed_support = (pcos_port * qcos + psin_port * qsin) / (port_energy * torch.sqrt(qcos.pow(2) + qsin.pow(2) + eps) + eps)
-        conf.mul_(float(group["confidence_decay"])).add_(signed_support.clamp(-1.0, 1.0), alpha=1.0 - float(group["confidence_decay"]))
-        conf.clamp_(-4.0, 4.0)
+        if isinstance(basis_pairs, _CudaBasisCache) and hasattr(basis_pairs.ops, "confidence_update"):
+            basis_pairs.ops.confidence_update(
+                conf,
+                pcos_port.contiguous(),
+                psin_port.contiguous(),
+                qcos.contiguous(),
+                qsin.contiguous(),
+                float(group["confidence_decay"]),
+                eps,
+            )
+        else:
+            port_energy = torch.sqrt(pcos_port.pow(2) + psin_port.pow(2) + eps)
+            signed_support = (pcos_port * qcos + psin_port * qsin) / (port_energy * torch.sqrt(qcos.pow(2) + qsin.pow(2) + eps) + eps)
+            conf.mul_(float(group["confidence_decay"])).add_(signed_support.clamp(-1.0, 1.0), alpha=1.0 - float(group["confidence_decay"]))
+            conf.clamp_(-4.0, 4.0)
 
         action: Tensor = state["action"]
-        action = self._contact_update_pair(
-            qcos, state["p_cos"], pcos_port, omega, state["calcium_cos"], action, group, rank
-        )
-        state["action"] = self._contact_update_pair(
-            qsin, state["p_sin"], psin_port, omega, state["calcium_sin"], action, group, rank
-        )
+        if isinstance(basis_pairs, _CudaBasisCache) and hasattr(basis_pairs.ops, "contact_update_pair"):
+            basis_pairs.ops.contact_update_pair(
+                qcos,
+                state["p_cos"],
+                pcos_port.contiguous(),
+                omega.contiguous(),
+                state["calcium_cos"],
+                action,
+                state["surprise"],
+                float(group["dt"]),
+                float(group["refractory_decay"]),
+                float(group["refractory_gain"]),
+                float(group["surprise_gain"]),
+                float(group["surprise_brake"]),
+                float(group["impulse_friction"]),
+                float(group["contact_gain"]),
+                float(group["restoring"]),
+                float(group["cubic"]),
+            )
+            basis_pairs.ops.contact_update_pair(
+                qsin,
+                state["p_sin"],
+                psin_port.contiguous(),
+                omega.contiguous(),
+                state["calcium_sin"],
+                action,
+                state["surprise"],
+                float(group["dt"]),
+                float(group["refractory_decay"]),
+                float(group["refractory_gain"]),
+                float(group["surprise_gain"]),
+                float(group["surprise_brake"]),
+                float(group["impulse_friction"]),
+                float(group["contact_gain"]),
+                float(group["restoring"]),
+                float(group["cubic"]),
+            )
+            state["action"] = action
+        else:
+            action = self._contact_update_pair(
+                qcos, state["p_cos"], pcos_port, omega, state["calcium_cos"], action, group, rank
+            )
+            state["action"] = self._contact_update_pair(
+                qsin, state["p_sin"], psin_port, omega, state["calcium_sin"], action, group, rank
+            )
         del self._current_surprise
 
         mode_gates = torch.sigmoid(float(group["confidence_gain"]) * conf).to(dtype)
@@ -1040,37 +1123,40 @@ class CRESSO5(Optimizer):
 
         force_rms = torch.sqrt(tangent_force.pow(2).mean() + eps)
         pred_rms = torch.sqrt(pred.pow(2).mean() + eps)
-        if pred_rms.item() > math.sqrt(eps):
-            alignment = ((tangent_force * pred).mean() / (force_rms * pred_rms + eps)).clamp(-1.0, 1.0)
-            align_gate = ((alignment + 1.0) * 0.5).clamp(0.0, 1.0)
-        else:
-            align_gate = torch.zeros((), device=param.device, dtype=dtype)
+        alignment = ((tangent_force * pred).mean() / (force_rms * pred_rms + eps)).clamp(-1.0, 1.0)
+        align_gate = torch.where(
+            pred_rms > math.sqrt(eps),
+            ((alignment + 1.0) * 0.5).clamp(0.0, 1.0),
+            torch.zeros((), device=param.device, dtype=dtype),
+        )
         warmup = 1.0 if int(group["warmup_steps"]) == 0 else (1.0 - math.exp(-step / max(1, int(group["warmup_steps"]))))
         surprise_penalty = 1.0 / (1.0 + state["surprise"].to(dtype))
-        mix = float(group["prediction_mix"]) * warmup * float(align_gate.item()) * float(surprise_penalty.item())
+        mix = float(group["prediction_mix"]) * warmup * align_gate * surprise_penalty
 
         clip = float(group["drive_clip"])
         bounded_force = torch.tanh(tangent_force / clip) * clip
         rational_force = tangent_force / (1.0 + tangent_force.abs() / clip)
         root_force = tangent_force.sign() * torch.sqrt(tangent_force.abs().clamp(max=clip * clip) + eps)
         root_force = _rms_normalize(root_force, torch.sqrt(rational_force.pow(2).mean() + eps), eps)
-        spike_mix = float(group["spike_mix"]) / (1.0 + float(state["surprise"].item()))
+        surprise_t = state["surprise"].to(dtype)
+        spike_mix = float(group["spike_mix"]) / (1.0 + surprise_t)
         base_force = (1.0 - spike_mix) * rational_force + spike_mix * bounded_force
-        root_mix = (float(group["root_channel_mix"]) if hard_enabled else 0.0) / (1.0 + 0.5 * float(state["surprise"].item()))
+        root_mix = (float(group["root_channel_mix"]) if hard_enabled else 0.0) / (1.0 + 0.5 * surprise_t)
         shaped_force = (1.0 - root_mix) * base_force + root_mix * root_force
+        shaped_rms = torch.sqrt(shaped_force.pow(2).mean() + eps)
         novelty = torch.tanh(error / (clip * (1.0 + state["surprise"].to(dtype)))) * clip
         if hard_enabled and float(group["echo_mix"]) != 0.0:
             echo_cos, echo_sin = _project_step(tangent_force, freqs, rank, basis_pairs)
             echo = _reconstruct_step(echo_cos, echo_sin, freqs, tuple(param.shape), dtype, basis_pairs=basis_pairs)
-            echo = _rms_normalize(echo, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
+            echo = _rms_normalize(echo, shaped_rms, eps)
         else:
             echo = 0.0
         if torch.is_tensor(hash_pred):
-            hash_pred = _rms_normalize(hash_pred, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
-        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * float(state["surprise"].item()))
-        direct_force = _rms_normalize(tangent_force, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
+            hash_pred = _rms_normalize(hash_pred, shaped_rms, eps)
+        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * surprise_t)
+        direct_force = tangent_force * (shaped_rms / force_rms.clamp_min(eps))
         core_force = (1.0 - direct_mix) * shaped_force + direct_mix * direct_force
-        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + float(state["surprise"].item()))
+        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + surprise_t)
         residual = _rms_normalize(error, torch.sqrt(core_force.pow(2).mean() + eps), eps)
         drive = (
             (1.0 - mix) * core_force
@@ -1083,8 +1169,9 @@ class CRESSO5(Optimizer):
 
         drive_energy_now = drive.pow(2).mean().to(state["drive_energy"].dtype)
         state["drive_energy"] = self._update_reservoir(state["drive_energy"], drive_energy_now, group["reservoir_decay"], step)
-        gain = float(group["target_update_rms"]) / math.sqrt(float(state["drive_energy"].item()) + eps)
-        gain = max(float(group["min_gain"]), min(float(group["max_gain"]), gain))
+        gain = (float(group["target_update_rms"]) / torch.sqrt(state["drive_energy"].to(dtype) + eps)).clamp(
+            float(group["min_gain"]), float(group["max_gain"])
+        )
         param.add_((drive * gain).to(dtype=param.dtype), alpha=-float(group["lr"]))
 
     def _micro_step(self, param: Tensor, grad: Tensor, group: dict) -> None:
@@ -1140,18 +1227,20 @@ class CRESSO5(Optimizer):
         clip = float(group["drive_clip"])
         bounded_force = torch.tanh(tangent_force / clip) * clip
         rational_force = tangent_force / (1.0 + tangent_force.abs() / clip)
-        spike_mix = float(group["spike_mix"]) / (1.0 + float(state["surprise"].item()))
+        surprise_t = state["surprise"].to(dtype)
+        spike_mix = float(group["spike_mix"]) / (1.0 + surprise_t)
         shaped_force = (1.0 - spike_mix) * rational_force + spike_mix * bounded_force
 
         pred_norm = _rms_normalize(pred, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
-        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * float(state["surprise"].item()))
-        micro_mix = float(group.get("micro_drive_mix", 0.0)) / (1.0 + 0.25 * float(state["surprise"].item()))
-        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + float(state["surprise"].item()))
+        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * surprise_t)
+        micro_mix = float(group.get("micro_drive_mix", 0.0)) / (1.0 + 0.25 * surprise_t)
+        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + surprise_t)
         direct_force = _rms_normalize(tangent_force, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
         residual = _rms_normalize(error, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
 
+        core_weight = (1.0 - direct_mix - 0.5 * micro_mix).clamp(0.0, 1.0)
         drive = (
-            max(0.0, min(1.0, 1.0 - direct_mix - 0.5 * micro_mix)) * shaped_force
+            core_weight * shaped_force
             + direct_mix * direct_force
             + micro_mix * pred_norm
             + residual_mix * residual
@@ -1159,8 +1248,9 @@ class CRESSO5(Optimizer):
 
         drive_energy_now = drive.pow(2).mean().to(state["drive_energy"].dtype)
         state["drive_energy"] = self._update_reservoir(state["drive_energy"], drive_energy_now, group["reservoir_decay"], step)
-        gain = float(group["target_update_rms"]) / math.sqrt(float(state["drive_energy"].item()) + eps)
-        gain = max(float(group["min_gain"]), min(float(group["max_gain"]), gain))
+        gain = (float(group["target_update_rms"]) / torch.sqrt(state["drive_energy"].to(dtype) + eps)).clamp(
+            float(group["min_gain"]), float(group["max_gain"])
+        )
         param.add_((drive * gain).to(dtype=param.dtype), alpha=-float(group["lr"]))
 
     def _scalar_step(self, param: Tensor, grad: Tensor, group: dict) -> None:
@@ -1210,8 +1300,8 @@ class CRESSO5(Optimizer):
         action: Tensor = state["action"]
         energy = 0.5 * (impulse.pow(2) + q.pow(2))
         action.mul_(0.985).add_((port * impulse - energy).to(action.dtype), alpha=dt)
-        friction = float(group["impulse_friction"]) + float(group["contact_gain"]) * torch.tanh(action.abs()).item()
-        impulse.mul_(max(0.0, 1.0 - dt * friction))
+        friction = float(group["impulse_friction"]) + float(group["contact_gain"]) * torch.tanh(action.abs()).to(impulse.dtype)
+        impulse.mul_(torch.clamp(1.0 - dt * friction, min=0.0))
         impulse.add_(plasticity * brake * port - float(group["restoring"]) * q - float(group["cubic"]) * q.pow(3), alpha=dt)
         q.add_(impulse, alpha=dt)
         q.clamp_(-8.0, 8.0)
@@ -1220,33 +1310,36 @@ class CRESSO5(Optimizer):
         error = tangent_force - pred
         force_rms = torch.sqrt(tangent_force.pow(2).mean() + eps)
         pred_rms = torch.sqrt(pred.pow(2).mean() + eps)
-        if pred_rms.item() > math.sqrt(eps):
-            alignment = ((tangent_force * pred).mean() / (force_rms * pred_rms + eps)).clamp(-1.0, 1.0)
-            align_gate = ((alignment + 1.0) * 0.5).clamp(0.0, 1.0)
-        else:
-            align_gate = torch.zeros((), device=param.device, dtype=dtype)
+        alignment = ((tangent_force * pred).mean() / (force_rms * pred_rms + eps)).clamp(-1.0, 1.0)
+        align_gate = torch.where(
+            pred_rms > math.sqrt(eps),
+            ((alignment + 1.0) * 0.5).clamp(0.0, 1.0),
+            torch.zeros((), device=param.device, dtype=dtype),
+        )
         warmup = 1.0 if int(group["warmup_steps"]) == 0 else (1.0 - math.exp(-step / max(1, int(group["warmup_steps"]))))
-        mix = float(group["prediction_mix"]) * warmup * float(align_gate.item()) / (1.0 + float(state["surprise"].item()))
+        surprise_t = state["surprise"].to(dtype)
+        mix = float(group["prediction_mix"]) * warmup * align_gate / (1.0 + surprise_t)
         clip = float(group["drive_clip"])
         bounded_force = torch.tanh(tangent_force / clip) * clip
         rational_force = tangent_force / (1.0 + tangent_force.abs() / clip)
         root_force = tangent_force.sign() * torch.sqrt(tangent_force.abs().clamp(max=clip * clip) + eps)
         root_force = _rms_normalize(root_force, torch.sqrt(rational_force.pow(2).mean() + eps), eps)
-        spike_mix = float(group["spike_mix"]) / (1.0 + float(state["surprise"].item()))
+        spike_mix = float(group["spike_mix"]) / (1.0 + surprise_t)
         base_force = (1.0 - spike_mix) * rational_force + spike_mix * bounded_force
-        root_mix = float(group["root_channel_mix"]) / (1.0 + 0.5 * float(state["surprise"].item()))
+        root_mix = float(group["root_channel_mix"]) / (1.0 + 0.5 * surprise_t)
         shaped_force = (1.0 - root_mix) * base_force + root_mix * root_force
         novelty = torch.tanh(error / (clip * (1.0 + state["surprise"].to(dtype)))) * clip
-        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * float(state["surprise"].item()))
+        direct_mix = float(group.get("direct_force_mix", 0.0)) / (1.0 + 0.35 * surprise_t)
         direct_force = _rms_normalize(tangent_force, torch.sqrt(shaped_force.pow(2).mean() + eps), eps)
         core_force = (1.0 - direct_mix) * shaped_force + direct_mix * direct_force
-        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + float(state["surprise"].item()))
+        residual_mix = float(group.get("residual_feedback_mix", 0.0)) / (1.0 + surprise_t)
         residual = _rms_normalize(error, torch.sqrt(core_force.pow(2).mean() + eps), eps)
         drive = (1.0 - mix) * core_force + mix * pred + float(group["novelty_mix"]) * novelty + residual_mix * residual
         drive_energy_now = drive.pow(2).mean().to(state["drive_energy"].dtype)
         state["drive_energy"] = self._update_reservoir(state["drive_energy"], drive_energy_now, group["reservoir_decay"], step)
-        gain = float(group["target_update_rms"]) / math.sqrt(float(state["drive_energy"].item()) + eps)
-        gain = max(float(group["min_gain"]), min(float(group["max_gain"]), gain))
+        gain = (float(group["target_update_rms"]) / torch.sqrt(state["drive_energy"].to(dtype) + eps)).clamp(
+            float(group["min_gain"]), float(group["max_gain"])
+        )
         param.add_((drive * gain).to(dtype=param.dtype), alpha=-float(group["lr"]))
 
 

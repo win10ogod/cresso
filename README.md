@@ -44,11 +44,13 @@ CRESSO5 now includes fused CUDA C++ operators for the heavy pieces:
 - basis projection,
 - basis reconstruction,
 - coordinate hash reduce-mean,
-- coordinate hash gather.
+- coordinate hash gather,
+- rank-state metric, confidence, and contact oscillator updates.
 
-The CUDA workspace is rebuilt inside `step()` and is not stored in optimizer
-state or serialized in `state_dict()`. This keeps the original persistent-state
-contract intact.
+The CUDA workspace is rebuilt inside `step()`, shared transiently across same
+shape/rank tensors in that step, and is not stored in optimizer state or
+serialized in `state_dict()`. This keeps the original persistent-state contract
+intact while reducing launch overhead for LoRA-heavy workloads.
 
 The CUDA path is enabled by default with `cuda_ops="auto"`. If CUDA extension
 loading fails, CRESSO5 falls back to the PyTorch reference path. Use
@@ -63,7 +65,7 @@ Measured on an NVIDIA RTX PRO 6000 Blackwell Workstation Edition with PyTorch
 | --- | ---: | ---: | ---: |
 | Single tensor `(2048, 2048)`, rank=8 | 64.580 ms/step | 12.376 ms/step | 5.22x |
 | Single tensor `(4096, 4096)`, rank=8 | 97.635 ms/step | 34.411 ms/step | 2.84x |
-| 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=8 | 2802.094 ms/step | 360.247 ms/step | 7.78x |
+| 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=4 | 1554.304 ms/step | 145.385 ms/step | 10.69x |
 
 Actual speed depends on rank, tensor shape, hash settings, CUDA toolkit, GPU,
 and whether a workload is launch-bound or memory-bandwidth-bound.

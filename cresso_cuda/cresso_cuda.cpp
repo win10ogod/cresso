@@ -41,6 +41,41 @@ torch::Tensor basis_reconstruct_with_cache_cuda(
     torch::Tensor axis_cache);
 torch::Tensor hash_reduce_mean_cuda(torch::Tensor x, int64_t bins, int64_t salt);
 torch::Tensor hash_gather_cuda(torch::Tensor values, std::vector<int64_t> sizes, int64_t salt);
+void metric_update_cuda(
+    torch::Tensor metric_cos,
+    torch::Tensor metric_sin,
+    torch::Tensor metric_p_cos,
+    torch::Tensor metric_p_sin,
+    torch::Tensor mcos_port,
+    torch::Tensor msin_port,
+    torch::Tensor omega,
+    double metric_dt,
+    double metric_friction);
+void confidence_update_cuda(
+    torch::Tensor confidence,
+    torch::Tensor pcos_port,
+    torch::Tensor psin_port,
+    torch::Tensor qcos,
+    torch::Tensor qsin,
+    double confidence_decay,
+    double eps);
+void contact_update_pair_cuda(
+    torch::Tensor q,
+    torch::Tensor p,
+    torch::Tensor port,
+    torch::Tensor omega,
+    torch::Tensor calcium,
+    torch::Tensor action,
+    torch::Tensor surprise,
+    double dt,
+    double refractory_decay,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_brake,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("basis_stats", &basis_stats_cuda, "CRESSO5 basis normalization stats (CUDA)");
@@ -60,4 +95,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "CRESSO5 fused basis reconstruction with axis cache (CUDA)");
     m.def("hash_reduce_mean", &hash_reduce_mean_cuda, "CRESSO5 coordinate hash reduce mean (CUDA)");
     m.def("hash_gather", &hash_gather_cuda, "CRESSO5 coordinate hash gather (CUDA)");
+    m.def("metric_update", &metric_update_cuda, "CRESSO5 fused rank metric oscillator update (CUDA)");
+    m.def("confidence_update", &confidence_update_cuda, "CRESSO5 fused rank confidence update (CUDA)");
+    m.def("contact_update_pair", &contact_update_pair_cuda, "CRESSO5 fused rank contact oscillator update (CUDA)");
 }
