@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import tempfile
 import unittest
 import warnings
 from pathlib import Path
@@ -21,6 +22,7 @@ class CressoCudaExtArchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
             mock.patch.object(cresso_cuda_ext.torch.cuda, "get_device_capability", return_value=(12, 0)), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_path", return_value="/usr/bin/nvcc"), \
+            mock.patch.object(cresso_cuda_ext, "_validate_cuda_runtime_match", return_value=None), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_supports_device_arch", return_value=False), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_version", return_value="Cuda compilation tools, release 12.0"), \
             self.assertRaisesRegex(RuntimeError, "sm_120.*does not support"):
@@ -33,6 +35,7 @@ class CressoCudaExtArchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
             mock.patch.object(cresso_cuda_ext.torch.cuda, "get_device_capability", return_value=(12, 0)), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_path", return_value="/usr/local/cuda-12.8/bin/nvcc"), \
+            mock.patch.object(cresso_cuda_ext, "_validate_cuda_runtime_match", return_value=None), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_supports_device_arch", return_value=True):
             arch = cresso_cuda_ext._configure_cuda_arch_list()
             self.assertEqual(os.environ["TORCH_CUDA_ARCH_LIST"], "12.0")
@@ -46,6 +49,7 @@ class CressoCudaExtArchTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(cresso_cuda_ext.torch.cuda, "get_device_capability", return_value=(12, 0)), \
                 mock.patch.object(cresso_cuda_ext, "_nvcc_path", return_value="/usr/bin/nvcc"), \
+                mock.patch.object(cresso_cuda_ext, "_validate_cuda_runtime_match", return_value=None), \
                 mock.patch.object(cresso_cuda_ext, "_nvcc_supports_device_arch", return_value=False), \
                 mock.patch.object(cresso_cuda_ext, "_nvcc_version", return_value="Cuda compilation tools, release 12.0"):
                 arch = cresso_cuda_ext._configure_cuda_arch_list()
@@ -62,6 +66,7 @@ class CressoCudaExtArchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
             mock.patch.object(cresso_cuda_ext.torch.cuda, "get_device_capability", return_value=(12, 0)), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_path", return_value="/usr/bin/nvcc"), \
+            mock.patch.object(cresso_cuda_ext, "_validate_cuda_runtime_match", return_value=None), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_supports_device_arch", return_value=False), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_version", return_value="Cuda compilation tools, release 12.0"), \
             self.assertRaisesRegex(RuntimeError, "TORCH_CUDA_ARCH_LIST.*sm_120"):
@@ -72,10 +77,46 @@ class CressoCudaExtArchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
             mock.patch.object(cresso_cuda_ext.torch.cuda, "get_device_capability", return_value=(12, 0)), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_path", return_value="/usr/bin/nvcc"), \
+            mock.patch.object(cresso_cuda_ext, "_validate_cuda_runtime_match", return_value=None), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_supports_device_arch", return_value=False), \
             mock.patch.object(cresso_cuda_ext, "_nvcc_version", return_value="Cuda compilation tools, release 12.0"), \
             self.assertRaisesRegex(RuntimeError, "CRESSO_CUDA_ARCH_LIST.*sm_120"):
             cresso_cuda_ext._configure_cuda_arch_list()
+
+    def test_default_nvcc_prefers_pytorch_runtime_major(self) -> None:
+        env: dict[str, str] = {}
+        cu128 = "/usr/local/cuda-12.8/bin/nvcc"
+        cu130 = "/home/win10/.local/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc"
+
+        def version_for(path: str | None):
+            return (12, 8) if path == cu128 else (13, 0)
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+            mock.patch.object(cresso_cuda_ext, "_candidate_nvcc_paths", return_value=[cu128, cu130]), \
+            mock.patch.object(cresso_cuda_ext, "_torch_cuda_version_tuple", return_value=(13, 0)), \
+            mock.patch.object(cresso_cuda_ext, "_nvcc_version_tuple", side_effect=version_for):
+            self.assertEqual(cresso_cuda_ext._nvcc_path(), cu130)
+
+    def test_configure_cuda_toolkit_rejects_mixed_runtime_major(self) -> None:
+        env: dict[str, str] = {"CUDACXX": "/usr/local/cuda-12.8/bin/nvcc"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+            mock.patch.object(cresso_cuda_ext, "_torch_cuda_version_tuple", return_value=(13, 0)), \
+            mock.patch.object(cresso_cuda_ext, "_nvcc_version_tuple", return_value=(12, 8)), \
+            self.assertRaisesRegex(RuntimeError, "mixed CUDA runtime"):
+            cresso_cuda_ext._configure_cuda_toolkit()
+
+    def test_cuda_runtime_linker_name_is_created_for_pytorch_wheel_toolkits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lib = home / "lib"
+            lib.mkdir()
+            (lib / "libcudart.so.13").write_text("", encoding="utf-8")
+
+            with mock.patch.object(cresso_cuda_ext, "_torch_cuda_version_tuple", return_value=(13, 0)):
+                cresso_cuda_ext._ensure_cuda_runtime_linker_name(str(home))
+
+            self.assertTrue((lib / "libcudart.so").is_symlink())
+            self.assertEqual(os.readlink(lib / "libcudart.so"), "libcudart.so.13")
 
     def test_extension_module_name_is_arch_specific(self) -> None:
         self.assertNotEqual(

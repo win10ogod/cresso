@@ -117,11 +117,9 @@ class CressoV5CudaOpsTests(unittest.TestCase):
             with self.subTest(dtype=str(dtype)):
                 torch.manual_seed(8642)
                 initial = (0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype)
-                grad = (0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype)
+                grads = [(0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype) for _ in range(2)]
                 cuda_param = torch.nn.Parameter(initial.clone())
                 ref_param = torch.nn.Parameter(initial.clone())
-                cuda_param.grad = grad.clone()
-                ref_param.grad = grad.clone()
                 common_kwargs = dict(
                     lr=1.0e-3,
                     rank=8,
@@ -136,8 +134,11 @@ class CressoV5CudaOpsTests(unittest.TestCase):
                 cuda_opt = cresso_v5.CRESSO5([cuda_param], cuda_ops="required", **common_kwargs)
                 ref_opt = cresso_v5.CRESSO5([ref_param], cuda_ops="off", **common_kwargs)
 
-                cuda_opt.step()
-                ref_opt.step()
+                for grad in grads:
+                    cuda_param.grad = grad.clone()
+                    ref_param.grad = grad.clone()
+                    cuda_opt.step()
+                    ref_opt.step()
                 torch.cuda.synchronize()
 
                 atol = 3.0e-3 if dtype is torch.float16 else 3.0e-2

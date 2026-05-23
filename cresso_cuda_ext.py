@@ -15,33 +15,108 @@ from torch.utils.cpp_extension import load
 
 _MODULE: ModuleType | None = None
 _MODULE_NAME: str | None = None
-_EXTENSION_ABI_TAG = "safe2"
+_EXTENSION_ABI_TAG = "safe5"
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in {"1", "true", "yes", "on"}
 
 
-def _nvcc_path() -> str | None:
-    cudacxx = os.environ.get("CUDACXX")
-    if cudacxx:
-        return cudacxx
+def _torch_cuda_version_tuple() -> tuple[int, int] | None:
+    version = torch.version.cuda
+    if not version:
+        return None
+    match = re.match(r"^(\d+)(?:\.(\d+))?", str(version))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
 
-    homes = [
-        os.environ.get("CRESSO_CUDA_HOME"),
-        os.environ.get("CUDA_HOME"),
-        "/usr/local/cuda-12.8",
-        "/usr/local/cuda",
-        str(Path.home() / ".local" / "cuda-12.8"),
+
+def _torch_bundled_cuda_home() -> str | None:
+    torch_cuda = _torch_cuda_version_tuple()
+    if torch_cuda is None:
+        return None
+    major, _minor = torch_cuda
+    torch_root = Path(torch.__file__).resolve().parent
+    home = torch_root.parent / "nvidia" / f"cu{major}"
+    return str(home) if (home / "bin" / "nvcc").is_file() else None
+
+
+def _nvcc_from_home(home: str | None) -> str | None:
+    if not home:
+        return None
+    nvcc = Path(home).expanduser() / "bin" / "nvcc"
+    return str(nvcc) if nvcc.is_file() else None
+
+
+def _explicit_nvcc_path() -> str | None:
+    return (
+        os.environ.get("CUDACXX")
+        or _nvcc_from_home(os.environ.get("CRESSO_CUDA_HOME"))
+        or _nvcc_from_home(os.environ.get("CUDA_HOME"))
+    )
+
+
+def _candidate_nvcc_paths() -> list[str]:
+    candidates: list[str | None] = [
+        os.environ.get("CUDACXX"),
+        _nvcc_from_home(os.environ.get("CRESSO_CUDA_HOME")),
+        _nvcc_from_home(os.environ.get("CUDA_HOME")),
+        _nvcc_from_home(_torch_bundled_cuda_home()),
     ]
-    for home in homes:
-        if not home:
+    torch_cuda = _torch_cuda_version_tuple()
+    if torch_cuda is not None:
+        major, minor = torch_cuda
+        candidates.extend(
+            [
+                _nvcc_from_home(f"/usr/local/cuda-{major}.{minor}"),
+                _nvcc_from_home(f"/usr/local/cuda-{major}"),
+            ]
+        )
+    candidates.extend(
+        [
+            _nvcc_from_home("/usr/local/cuda-12.8"),
+            _nvcc_from_home("/usr/local/cuda"),
+            _nvcc_from_home(str(Path.home() / ".local" / "cuda-12.8")),
+            shutil.which("nvcc"),
+        ]
+    )
+    seen: set[str] = set()
+    paths: list[str] = []
+    for candidate in candidates:
+        if not candidate:
             continue
-        nvcc = Path(home) / "bin" / "nvcc"
-        if nvcc.is_file():
-            return str(nvcc)
+        path = str(Path(candidate).expanduser())
+        if path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
 
-    return shutil.which("nvcc")
+
+def _nvcc_path() -> str | None:
+    explicit = _explicit_nvcc_path()
+    if explicit:
+        return explicit
+    return _runtime_compatible_nvcc_path()
+
+
+def _runtime_compatible_nvcc_path() -> str | None:
+    candidates = _candidate_nvcc_paths()
+    if not candidates:
+        return None
+    if _env_flag("CRESSO_CUDA_ALLOW_RUNTIME_MISMATCH"):
+        return candidates[0]
+
+    torch_cuda = _torch_cuda_version_tuple()
+    if torch_cuda is None:
+        return candidates[0]
+
+    for candidate in candidates:
+        nvcc_cuda = _nvcc_version_tuple(candidate)
+        if nvcc_cuda is None or nvcc_cuda[0] == torch_cuda[0]:
+            return candidate
+    return candidates[0]
 
 
 def _cuda_home_from_nvcc(nvcc: str | None) -> str | None:
@@ -54,9 +129,50 @@ def _cuda_home_from_nvcc(nvcc: str | None) -> str | None:
     return str(home) if home.is_dir() else None
 
 
+def _cuda_lib_dir(cuda_home: str | None) -> Path | None:
+    if not cuda_home:
+        return None
+    home = Path(cuda_home)
+    for name in ("lib64", "lib"):
+        lib = home / name
+        if lib.is_dir():
+            return lib
+    return None
+
+
+def _ensure_cuda_runtime_linker_name(cuda_home: str | None) -> None:
+    torch_cuda = _torch_cuda_version_tuple()
+    lib_dir = _cuda_lib_dir(cuda_home)
+    if torch_cuda is None or lib_dir is None:
+        return
+    major, _minor = torch_cuda
+    unversioned = lib_dir / "libcudart.so"
+    versioned = lib_dir / f"libcudart.so.{major}"
+    if unversioned.exists():
+        resolved = unversioned.resolve()
+        if versioned.exists() and resolved != versioned.resolve() and not _env_flag("CRESSO_CUDA_ALLOW_RUNTIME_MISMATCH"):
+            raise RuntimeError(
+                f"CRESSO5 CUDA ops refuse to link against {unversioned}, which resolves to {resolved}, "
+                f"because PyTorch uses CUDA {major}.x. Fix the CUDA toolkit path or set "
+                "CRESSO_CUDA_ALLOW_RUNTIME_MISMATCH=1 only for diagnostics."
+            )
+        return
+    if not versioned.exists():
+        return
+    try:
+        unversioned.symlink_to(versioned.name)
+    except OSError as exc:
+        raise RuntimeError(
+            f"CRESSO5 CUDA ops could not create {unversioned} -> {versioned.name}. "
+            "The selected CUDA toolkit lacks the unversioned linker name required by PyTorch extensions."
+        ) from exc
+
+
 def _configure_cuda_toolkit() -> str | None:
     nvcc = _nvcc_path()
+    _validate_cuda_runtime_match(nvcc)
     cuda_home = _cuda_home_from_nvcc(nvcc)
+    _ensure_cuda_runtime_linker_name(cuda_home)
     if nvcc:
         os.environ["CUDACXX"] = nvcc
     if cuda_home:
@@ -85,6 +201,39 @@ def _run_nvcc(nvcc: str | None, *args: str) -> str:
 
 def _nvcc_version() -> str:
     return _run_nvcc(_nvcc_path(), "--version").strip()
+
+
+def _nvcc_version_tuple(nvcc: str | None) -> tuple[int, int] | None:
+    output = _run_nvcc(nvcc, "--version")
+    match = re.search(r"release\s+(\d+)\.(\d+)", output)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _validate_cuda_runtime_match(nvcc: str | None) -> None:
+    torch_cuda = _torch_cuda_version_tuple()
+    nvcc_cuda = _nvcc_version_tuple(nvcc)
+    if torch_cuda is None or nvcc_cuda is None:
+        return
+    if torch_cuda[0] == nvcc_cuda[0]:
+        return
+    if _env_flag("CRESSO_CUDA_ALLOW_RUNTIME_MISMATCH"):
+        warnings.warn(
+            "CRESSO5 CUDA ops are building with an nvcc runtime major version that does not "
+            f"match PyTorch: nvcc CUDA {nvcc_cuda[0]}.{nvcc_cuda[1]} at {nvcc}, "
+            f"PyTorch CUDA {torch_cuda[0]}.{torch_cuda[1]}. This is for diagnostics only.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return
+    raise RuntimeError(
+        "CRESSO5 CUDA ops refuse to build with mixed CUDA runtime major versions: "
+        f"nvcc CUDA {nvcc_cuda[0]}.{nvcc_cuda[1]} at {nvcc}, "
+        f"but PyTorch was built for CUDA {torch_cuda[0]}.{torch_cuda[1]}. "
+        "Install/select an nvcc toolkit matching PyTorch CUDA, or set "
+        "CRESSO_CUDA_ALLOW_RUNTIME_MISMATCH=1 only for diagnostics."
+    )
 
 
 def _nvcc_supports_device_arch(major: int, minor: int) -> bool:
@@ -209,11 +358,14 @@ def load_cuda_ops(*, verbose: bool | None = None) -> ModuleType:
     if _MODULE is not None and _MODULE_NAME == module_name:
         return _MODULE
 
+    cuda_lib = _cuda_lib_dir(os.environ.get("CUDA_HOME"))
+    extra_ldflags = [f"-Wl,-rpath,{cuda_lib}"] if cuda_lib is not None else []
     _MODULE = load(
         name=module_name,
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+        extra_ldflags=extra_ldflags,
         with_cuda=True,
         verbose=bool(verbose),
     )
