@@ -2508,7 +2508,6 @@ __global__ void scalar_pre_contact_partial_kernel(
     const grad_t* grad,
     const double* row_sums,
     const double* col_sums,
-    work_t* tangent_out,
     const work_t* q,
     int64_t rows,
     int64_t cols,
@@ -2542,7 +2541,6 @@ __global__ void scalar_pre_contact_partial_kernel(
             instant_metric_coupling,
             instant_metric_power,
             eps);
-        tangent_out[i] = static_cast<work_t>(tangent);
         const double error = tangent - qv;
         err_sum += error;
         err2_sum += error * error;
@@ -2612,14 +2610,21 @@ __global__ void scalar_contact_update_kernel(
     }
 }
 
-template <typename work_t>
+template <typename param_t, typename grad_t>
 __global__ void scalar_drive_stats_partial_kernel(
-    const work_t* tangent,
+    const param_t* param,
+    const grad_t* grad,
+    const double* row_sums,
+    const double* col_sums,
     int64_t rows,
     int64_t cols,
     int64_t n,
     int chunks,
     const double* stats,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
     double clip,
     double eps,
     double* partial) {
@@ -2633,7 +2638,21 @@ __global__ void scalar_drive_stats_partial_kernel(
     double error2 = 0.0;
     for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<int64_t>(chunks) * blockDim.x) {
-        const double t = static_cast<double>(tangent[i]);
+        const double t = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            n,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
         const double e = t - qv;
         const double rational = t / (1.0 + fabs(t) / clip);
         const double root_raw = (t < 0.0 ? -1.0 : (t > 0.0 ? 1.0 : 0.0)) * sqrt(fmin(fabs(t), clip * clip) + eps);
@@ -2713,14 +2732,21 @@ __device__ __forceinline__ double scalar_shaped_value(double t, const double* st
     return (1.0 - root_mix) * base + root_mix * root;
 }
 
-template <typename work_t>
+template <typename param_t, typename grad_t, typename work_t>
 __global__ void scalar_shaped_partial_kernel(
-    const work_t* tangent,
+    const param_t* param,
+    const grad_t* grad,
+    const double* row_sums,
+    const double* col_sums,
     int64_t rows,
     int64_t cols,
     int64_t n,
     int chunks,
     const double* stats,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
     double root_channel_mix,
     double spike_mix,
     double clip,
@@ -2730,7 +2756,21 @@ __global__ void scalar_shaped_partial_kernel(
     double shaped2 = 0.0;
     for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<int64_t>(chunks) * blockDim.x) {
-        const double t = static_cast<double>(tangent[i]);
+        const double t = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            n,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
         const double shaped = scalar_shaped_value<work_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
         shaped2 += shaped * shaped;
     }
@@ -2753,14 +2793,21 @@ __global__ void scalar_one_stat_finalize_kernel(const double* partial, int chunk
     }
 }
 
-template <typename work_t>
+template <typename param_t, typename grad_t, typename work_t>
 __global__ void scalar_core_partial_kernel(
-    const work_t* tangent,
+    const param_t* param,
+    const grad_t* grad,
+    const double* row_sums,
+    const double* col_sums,
     int64_t rows,
     int64_t cols,
     int64_t n,
     int chunks,
     const double* stats,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
     double direct_force_mix,
     double root_channel_mix,
     double spike_mix,
@@ -2772,7 +2819,21 @@ __global__ void scalar_core_partial_kernel(
     double core2 = 0.0;
     for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<int64_t>(chunks) * blockDim.x) {
-        const double t = static_cast<double>(tangent[i]);
+        const double t = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            n,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
         const double shaped = scalar_shaped_value<work_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
         const double direct = t * (stats[10] / fmax(stats[4], eps));
         const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
@@ -2785,15 +2846,21 @@ __global__ void scalar_core_partial_kernel(
     }
 }
 
-template <typename work_t>
+template <typename param_t, typename grad_t, typename work_t>
 __global__ void scalar_drive_partial_kernel(
-    const work_t* tangent,
-    work_t* drive,
+    const param_t* param,
+    const grad_t* grad,
+    const double* row_sums,
+    const double* col_sums,
     int64_t rows,
     int64_t cols,
     int64_t n,
     int chunks,
     const double* stats,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
     double novelty_mix,
     double direct_force_mix,
     double residual_feedback_mix,
@@ -2809,7 +2876,21 @@ __global__ void scalar_drive_partial_kernel(
     double drive2 = 0.0;
     for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<int64_t>(chunks) * blockDim.x) {
-        const double t = static_cast<double>(tangent[i]);
+        const double t = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            n,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
         const double error = t - qv;
         const double shaped = scalar_shaped_value<work_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
         const double direct = t * (stats[10] / fmax(stats[4], eps));
@@ -2817,7 +2898,6 @@ __global__ void scalar_drive_partial_kernel(
         const double residual = error * (stats[11] / fmax(stats[8], eps));
         const double novelty = tanh(error / (clip * (1.0 + stats[3]))) * clip;
         const double d = (1.0 - stats[9]) * core + stats[9] * qv + novelty_mix * novelty + residual_mix * residual;
-        drive[i] = static_cast<work_t>(d);
         drive2 += d * d;
     }
     extern __shared__ double shared[];
@@ -2855,12 +2935,57 @@ __global__ void scalar_gain_finalize_kernel(
     }
 }
 
-template <typename param_t, typename work_t>
-__global__ void scalar_param_apply_kernel(param_t* param, const work_t* drive, const double* stats, int64_t n, double lr) {
+template <typename param_t, typename grad_t, typename work_t>
+__global__ void scalar_param_apply_kernel(
+    param_t* param,
+    const grad_t* grad,
+    const double* row_sums,
+    const double* col_sums,
+    const double* stats,
+    int64_t rows,
+    int64_t cols,
+    int64_t n,
+    double lr,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
+    double novelty_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps) {
     const double gain = stats[12];
+    const double qv = stats[2];
+    const double direct_mix = direct_force_mix / (1.0 + 0.35 * stats[3]);
+    const double residual_mix = residual_feedback_mix / (1.0 + stats[3]);
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const param_t rounded_drive = static_cast<param_t>(static_cast<double>(drive[i]) * gain);
+        const double t = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            n,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
+        const double error = t - qv;
+        const double shaped = scalar_shaped_value<work_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
+        const double direct = t * (stats[10] / fmax(stats[4], eps));
+        const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
+        const double residual = error * (stats[11] / fmax(stats[8], eps));
+        const double novelty = tanh(error / (clip * (1.0 + stats[3]))) * clip;
+        const double drive = (1.0 - stats[9]) * core + stats[9] * qv + novelty_mix * novelty + residual_mix * residual;
+        const param_t rounded_drive = static_cast<param_t>(drive * gain);
         param[i] = static_cast<param_t>(static_cast<double>(param[i]) - lr * static_cast<double>(rounded_drive));
     }
 }
@@ -3145,7 +3270,7 @@ void scalar_update_2d_cuda(
     TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "scalar_update_2d requires contiguous tensors");
     TORCH_CHECK(is_param_dtype(param.scalar_type()), "scalar_update_2d supports float16, bfloat16, float32, and float64 params");
     const at::ScalarType work_dtype = work_dtype_for_param(param.scalar_type());
-    TORCH_CHECK(grad.scalar_type() == work_dtype, "scalar_update_2d grad must use the parameter work dtype");
+    TORCH_CHECK(is_param_dtype(grad.scalar_type()), "scalar_update_2d grad supports float16, bfloat16, float32, and float64");
     check_same_device(param, grad, "grad");
     TORCH_CHECK(param.sizes() == grad.sizes(), "scalar_update_2d shape mismatch");
     TORCH_CHECK(param.size(0) > 0 && param.size(1) > 0, "scalar_update_2d requires a non-empty 2D tensor");
@@ -3225,17 +3350,17 @@ void scalar_update_2d_cuda(
     auto row_sums = torch::empty({rows}, work_options.dtype(torch::kFloat64));
     auto col_sums = torch::empty({cols}, work_options.dtype(torch::kFloat64));
     auto stats = torch::empty({16}, work_options.dtype(torch::kFloat64));
-    auto tangent = torch::empty(param.sizes(), work_options);
-    auto drive = torch::empty(param.sizes(), work_options);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, param.scalar_type(), "scalar_update_2d_cuda_param", [&] {
         using param_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, grad.scalar_type(), "scalar_update_2d_cuda_grad", [&] {
+        using grad_t = scalar_t;
         AT_DISPATCH_FLOATING_TYPES(work_dtype, "scalar_update_2d_cuda_work", [&] {
         using work_t = scalar_t;
-        scalar_force_partial_kernel<param_t, work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+        scalar_force_partial_kernel<param_t, grad_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
             param.data_ptr<param_t>(),
-            grad.data_ptr<work_t>(),
+            grad.data_ptr<grad_t>(),
             n,
             chunks,
             weight_decay,
@@ -3253,13 +3378,13 @@ void scalar_update_2d_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         C10_CUDA_CHECK(cudaMemsetAsync(row_sums.data_ptr<double>(), 0, row_bytes, stream));
         C10_CUDA_CHECK(cudaMemsetAsync(col_sums.data_ptr<double>(), 0, col_bytes, stream));
-        scalar_axis_density_kernel<param_t, work_t><<<
+        scalar_axis_density_kernel<param_t, grad_t><<<
             chunks,
             kThreads,
             4 * kThreads * sizeof(double),
             stream>>>(
             param.data_ptr<param_t>(),
-            grad.data_ptr<work_t>(),
+            grad.data_ptr<grad_t>(),
             row_sums.data_ptr<double>(),
             col_sums.data_ptr<double>(),
             rows,
@@ -3284,16 +3409,15 @@ void scalar_update_2d_cuda(
             metric_coupling,
             stats.data_ptr<double>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_pre_contact_partial_kernel<param_t, work_t, work_t><<<
+        scalar_pre_contact_partial_kernel<param_t, grad_t, work_t><<<
             chunks,
             kThreads,
             4 * kThreads * sizeof(double),
             stream>>>(
             param.data_ptr<param_t>(),
-            grad.data_ptr<work_t>(),
+            grad.data_ptr<grad_t>(),
             row_sums.data_ptr<double>(),
             col_sums.data_ptr<double>(),
-            tangent.data_ptr<work_t>(),
             q.data_ptr<work_t>(),
             rows,
             cols,
@@ -3328,17 +3452,24 @@ void scalar_update_2d_cuda(
             eps,
             stats.data_ptr<double>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_drive_stats_partial_kernel<work_t><<<
+        scalar_drive_stats_partial_kernel<param_t, grad_t><<<
             chunks,
             kThreads,
             6 * kThreads * sizeof(double),
             stream>>>(
-            tangent.data_ptr<work_t>(),
+            param.data_ptr<param_t>(),
+            grad.data_ptr<grad_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
             rows,
             cols,
             n,
             chunks,
             stats.data_ptr<double>(),
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
             drive_clip,
             eps,
             partial6.data_ptr<double>());
@@ -3353,13 +3484,20 @@ void scalar_update_2d_cuda(
             eps,
             stats.data_ptr<double>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_shaped_partial_kernel<work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
-            tangent.data_ptr<work_t>(),
+        scalar_shaped_partial_kernel<param_t, grad_t, work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            param.data_ptr<param_t>(),
+            grad.data_ptr<grad_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
             rows,
             cols,
             n,
             chunks,
             stats.data_ptr<double>(),
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
             root_channel_mix,
             spike_mix,
             drive_clip,
@@ -3374,13 +3512,20 @@ void scalar_update_2d_cuda(
             stats.data_ptr<double>(),
             10);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_core_partial_kernel<work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
-            tangent.data_ptr<work_t>(),
+        scalar_core_partial_kernel<param_t, grad_t, work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            param.data_ptr<param_t>(),
+            grad.data_ptr<grad_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
             rows,
             cols,
             n,
             chunks,
             stats.data_ptr<double>(),
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
             direct_force_mix,
             root_channel_mix,
             spike_mix,
@@ -3396,14 +3541,20 @@ void scalar_update_2d_cuda(
             stats.data_ptr<double>(),
             11);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_drive_partial_kernel<work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
-            tangent.data_ptr<work_t>(),
-            drive.data_ptr<work_t>(),
+        scalar_drive_partial_kernel<param_t, grad_t, work_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            param.data_ptr<param_t>(),
+            grad.data_ptr<grad_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
             rows,
             cols,
             n,
             chunks,
             stats.data_ptr<double>(),
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
             novelty_mix,
             direct_force_mix,
             residual_feedback_mix,
@@ -3426,12 +3577,28 @@ void scalar_update_2d_cuda(
             eps,
             stats.data_ptr<double>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        scalar_param_apply_kernel<param_t, work_t><<<blocks, kThreads, 0, stream>>>(
+        scalar_param_apply_kernel<param_t, grad_t, work_t><<<blocks, kThreads, 0, stream>>>(
             param.data_ptr<param_t>(),
-            drive.data_ptr<work_t>(),
+            grad.data_ptr<grad_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
             stats.data_ptr<double>(),
+            rows,
+            cols,
             n,
-            lr);
+            lr,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            novelty_mix,
+            direct_force_mix,
+            residual_feedback_mix,
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps);
+        });
         });
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -57,6 +57,23 @@ class CressoV5CudaSafetyTests(unittest.TestCase):
         self.assertIs(second, state)
         self.assertEqual(float(state), 4.0)
 
+    def test_scalar_cuda_update_does_not_allocate_dense_tangent_or_drive_workspace(self) -> None:
+        kernel_path = Path(__file__).resolve().parents[1] / "cresso_cuda" / "cresso_cuda_kernel.cu"
+        source = kernel_path.read_text(encoding="utf-8")
+        start = source.index("void scalar_update_2d_cuda(")
+        scalar_update_block = source[start:]
+
+        self.assertNotIn("auto tangent = torch::empty(param.sizes()", scalar_update_block)
+        self.assertNotIn("auto drive = torch::empty(param.sizes()", scalar_update_block)
+
+    def test_scalar_cuda_update_does_not_force_dense_grad_work_copy(self) -> None:
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        start = source.index("ops.scalar_update_2d(")
+        end = source.index("eps,", start)
+        scalar_call = source[start:end]
+
+        self.assertNotIn("grad.to(dtype=dtype).contiguous()", scalar_call)
+
 
 if __name__ == "__main__":
     unittest.main()

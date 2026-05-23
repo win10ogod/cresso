@@ -125,6 +125,10 @@ class CressoCudaExtArchTests(unittest.TestCase):
         )
         self.assertIn("12_0", cresso_cuda_ext._extension_module_name("12.0"))
 
+    def test_extension_module_name_includes_source_hash(self) -> None:
+        name = cresso_cuda_ext._extension_module_name("12.0", "deadbeef1234")
+        self.assertIn("deadbeef1234", name)
+
 
 if __name__ == "__main__":
     unittest.main()

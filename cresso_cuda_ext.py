@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -336,9 +337,21 @@ def _configure_cuda_arch_list() -> str:
     )
 
 
-def _extension_module_name(arch_list: str) -> str:
+def _source_hash(paths: list[str]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        p = Path(path)
+        digest.update(str(p.name).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(p.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
+
+
+def _extension_module_name(arch_list: str, source_hash: str | None = None) -> str:
     suffix = re.sub(r"[^0-9A-Za-z]+", "_", arch_list).strip("_").lower() or "default"
-    return f"cresso_v5_cuda_{suffix}_{_EXTENSION_ABI_TAG}"
+    src = re.sub(r"[^0-9A-Za-z]+", "_", source_hash or "nosrc").strip("_").lower()
+    return f"cresso_v5_cuda_{suffix}_{src}_{_EXTENSION_ABI_TAG}"
 
 
 def load_cuda_ops(*, verbose: bool | None = None) -> ModuleType:
@@ -354,7 +367,7 @@ def load_cuda_ops(*, verbose: bool | None = None) -> ModuleType:
     if verbose is None:
         verbose = os.environ.get("CRESSO_CUDA_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
     arch_list = _configure_cuda_arch_list()
-    module_name = _extension_module_name(arch_list)
+    module_name = _extension_module_name(arch_list, _source_hash(sources))
     if _MODULE is not None and _MODULE_NAME == module_name:
         return _MODULE
 

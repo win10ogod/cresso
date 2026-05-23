@@ -1456,7 +1456,7 @@ class CRESSO5(Optimizer):
             if ops is not None and hasattr(ops, "scalar_update_2d"):
                 ops.scalar_update_2d(
                     param,
-                    grad.to(dtype=dtype).contiguous(),
+                    grad.contiguous(),
                     state["q"],
                     state["impulse"],
                     state["metric_q"],
