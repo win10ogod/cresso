@@ -523,6 +523,41 @@ def count_optimizer_state_elements(optimizer: Optimizer) -> int:
     return int(total)
 
 
+def _normalize_thin_matrix_route(route: str) -> str:
+    route_s = str(route).lower()
+    if route_s not in {"scalar", "spectral"}:
+        raise ValueError("thin_matrix_route must be one of 'scalar' or 'spectral'")
+    return route_s
+
+
+def _is_lora_thin_matrix_shape(
+    shape: Sequence[int],
+    thin_matrix_max_width: int = 64,
+    thin_matrix_min_aspect: float = 4.0,
+) -> bool:
+    dims = tuple(int(d) for d in shape)
+    if len(dims) != 2 or int(thin_matrix_max_width) <= 0:
+        return False
+    short = min(dims)
+    long = max(dims)
+    if short <= 0:
+        return False
+    return short <= int(thin_matrix_max_width) and (long / short) >= float(thin_matrix_min_aspect)
+
+
+def _thin_matrix_uses_scalar_route(
+    shape: Sequence[int],
+    thin_matrix_route: str = "scalar",
+    thin_matrix_max_width: int = 64,
+    thin_matrix_min_aspect: float = 4.0,
+) -> bool:
+    return _normalize_thin_matrix_route(thin_matrix_route) == "scalar" and _is_lora_thin_matrix_shape(
+        shape,
+        thin_matrix_max_width=thin_matrix_max_width,
+        thin_matrix_min_aspect=thin_matrix_min_aspect,
+    )
+
+
 def theoretical_state_elements(
     shape: Sequence[int],
     rank: int,
@@ -532,6 +567,9 @@ def theoretical_state_elements(
     micro_field_max_size: int = 0,
     hard_channel_min_size: int = 16,
     thin_matrix_hard_cutoff: int = 8,
+    thin_matrix_max_width: int = 64,
+    thin_matrix_min_aspect: float = 4.0,
+    thin_matrix_route: str = "scalar",
 ) -> int:
     dims = tuple(int(d) for d in shape)
     ndim = len(dims)
@@ -541,6 +579,12 @@ def theoretical_state_elements(
         n *= d
     if int(micro_field_max_size) > 0 and n <= int(micro_field_max_size) and ndim > 0:
         return int(3 * n + 4)
+    spectral = bool(spectral) and not _thin_matrix_uses_scalar_route(
+        dims,
+        thin_matrix_route=thin_matrix_route,
+        thin_matrix_max_width=thin_matrix_max_width,
+        thin_matrix_min_aspect=thin_matrix_min_aspect,
+    )
     if spectral:
         thin_matrix = ndim == 2 and int(thin_matrix_hard_cutoff) > 0 and min(dims) <= int(thin_matrix_hard_cutoff)
         hard_enabled = n >= int(hard_channel_min_size) and not thin_matrix
@@ -617,6 +661,9 @@ class CRESSO5(Optimizer):
         cuda_ops: str | bool = "auto",
         hard_channel_min_size: int = 16,
         thin_matrix_hard_cutoff: int = 8,
+        thin_matrix_max_width: int = 64,
+        thin_matrix_min_aspect: float = 4.0,
+        thin_matrix_route: str = "scalar",
         maximize: bool = False,
         eps: float = 1e-8,
     ) -> None:
@@ -683,10 +730,14 @@ class CRESSO5(Optimizer):
             raise ValueError("hard_channel_min_size must be >= 0")
         if int(thin_matrix_hard_cutoff) < 0:
             raise ValueError("thin_matrix_hard_cutoff must be >= 0")
+        if int(thin_matrix_max_width) < 0:
+            raise ValueError("thin_matrix_max_width must be >= 0")
+        _validate_scalar("thin_matrix_min_aspect", thin_matrix_min_aspect, 1.0, None)
         if int(warmup_steps) < 0:
             raise ValueError("warmup_steps must be non-negative")
         if min_gain > max_gain:
             raise ValueError("min_gain must be <= max_gain")
+        thin_matrix_route_s = _normalize_thin_matrix_route(thin_matrix_route)
         if isinstance(cuda_ops, bool):
             cuda_ops_mode = "auto" if cuda_ops else "off"
         else:
@@ -747,6 +798,9 @@ class CRESSO5(Optimizer):
             cuda_ops=cuda_ops_mode,
             hard_channel_min_size=int(hard_channel_min_size),
             thin_matrix_hard_cutoff=int(thin_matrix_hard_cutoff),
+            thin_matrix_max_width=int(thin_matrix_max_width),
+            thin_matrix_min_aspect=float(thin_matrix_min_aspect),
+            thin_matrix_route=thin_matrix_route_s,
             maximize=bool(maximize),
             eps=float(eps),
         )
@@ -770,11 +824,21 @@ class CRESSO5(Optimizer):
                     grad = -grad
                 if int(group.get("micro_field_max_size", 0)) > 0 and param.ndim > 0 and param.numel() <= int(group["micro_field_max_size"]):
                     self._micro_step(param, grad, group)
-                elif param.numel() >= group["min_spectral_size"] and group["rank"] > 0 and param.ndim > 0:
+                elif self._use_spectral_route(param, group):
                     self._spectral_step(param, grad, group, transient_basis_workspace)
                 else:
                     self._scalar_step(param, grad, group)
         return loss
+
+    def _use_spectral_route(self, param: Tensor, group: dict) -> bool:
+        if not (param.numel() >= int(group["min_spectral_size"]) and int(group["rank"]) > 0 and param.ndim > 0):
+            return False
+        return not _thin_matrix_uses_scalar_route(
+            tuple(param.shape),
+            thin_matrix_route=str(group.get("thin_matrix_route", "scalar")),
+            thin_matrix_max_width=int(group.get("thin_matrix_max_width", 64)),
+            thin_matrix_min_aspect=float(group.get("thin_matrix_min_aspect", 4.0)),
+        )
 
     def _init_common(self, state: dict, device: torch.device, dtype: torch.dtype) -> None:
         state["step"] = 0
@@ -1360,6 +1424,65 @@ class CRESSO5(Optimizer):
         state["step"] += 1
         step = int(state["step"])
         eps = float(group["eps"])
+
+        cuda_mode = str(group.get("cuda_ops", "auto"))
+        if (
+            cuda_mode != "off"
+            and param.is_cuda
+            and grad.is_cuda
+            and param.ndim == 2
+            and param.is_contiguous()
+            and param.dtype in (torch.float32, torch.float64)
+            and grad.dtype == param.dtype
+            and state["q"].dtype == param.dtype
+        ):
+            ops = _load_cuda_ops(required=cuda_mode == "required")
+            if ops is not None and hasattr(ops, "scalar_update_2d"):
+                ops.scalar_update_2d(
+                    param,
+                    grad.contiguous(),
+                    state["q"],
+                    state["impulse"],
+                    state["metric_q"],
+                    state["metric_impulse"],
+                    state["force_rms"],
+                    state["drive_energy"],
+                    state["surprise"],
+                    state["action"],
+                    step,
+                    float(group["lr"]),
+                    float(group["weight_decay"]),
+                    float(group["energy_power"]),
+                    float(group["metric_dt"]),
+                    float(group["metric_friction"]),
+                    float(group["metric_coupling"]),
+                    float(group["local_sharpness"]),
+                    float(group["instant_metric_coupling"]),
+                    float(group["instant_metric_power"]),
+                    float(group["dt"]),
+                    float(group["impulse_friction"]),
+                    float(group["contact_gain"]),
+                    float(group["restoring"]),
+                    float(group["cubic"]),
+                    float(group["reservoir_decay"]),
+                    float(group["refractory_gain"]),
+                    float(group["surprise_gain"]),
+                    float(group["surprise_decay"]),
+                    float(group["prediction_mix"]),
+                    float(group["novelty_mix"]),
+                    int(group["warmup_steps"]),
+                    float(group["surprise_brake"]),
+                    float(group["target_update_rms"]),
+                    float(group["min_gain"]),
+                    float(group["max_gain"]),
+                    float(group["drive_clip"]),
+                    float(group["spike_mix"]),
+                    float(group["root_channel_mix"]),
+                    float(group.get("direct_force_mix", 0.0)),
+                    float(group.get("residual_feedback_mix", 0.0)),
+                    eps,
+                )
+                return
 
         force = self._base_force(param, grad, group, dtype)
         force_rms_now = torch.sqrt(force.pow(2).mean() + eps)

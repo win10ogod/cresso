@@ -47,7 +47,8 @@ CRESSO5 now includes fused CUDA C++ operators for the heavy pieces:
 - fused coordinate hash impulse update and gather,
 - fused 2D instant axial metric,
 - rank-state metric, confidence, and contact oscillator updates,
-- final dense drive shaping and parameter update.
+- final dense drive shaping and parameter update,
+- fused 2D scalar update for LoRA-like thin matrices.
 
 The CUDA workspace is rebuilt inside `step()`, shared transiently across same
 shape/rank tensors in that step, and is not stored in optimizer state or
@@ -67,10 +68,29 @@ Measured on an NVIDIA RTX PRO 6000 Blackwell Workstation Edition with PyTorch
 | --- | ---: | ---: | ---: |
 | Single tensor `(2048, 2048)`, rank=8 | 64.580 ms/step | 12.376 ms/step | 5.22x |
 | Single tensor `(4096, 4096)`, rank=8 | 97.635 ms/step | 34.411 ms/step | 2.84x |
-| 64 LoRA-like tensors `(4096,16)/(16,4096)`, rank=4 | 1491.470 ms/step | 69.669 ms/step | 21.41x |
+| 64 LoRA-like thin tensors `(4096,16)/(16,4096)`, rank=4 | 103.392 ms/step | 43.477 ms/step | 2.38x |
 
 Actual speed depends on rank, tensor shape, hash settings, CUDA toolkit, GPU,
 and whether a workload is launch-bound or memory-bandwidth-bound.
+
+### Thin LoRA Routing
+
+CRESSO5 treats high-aspect 2D LoRA matrices as thin matrices by default when
+their smaller dimension is at most `thin_matrix_max_width=64` and their aspect
+ratio is at least `thin_matrix_min_aspect=4.0`. These tensors use the compact
+scalar route plus the fused `scalar_update_2d` CUDA operator instead of the
+spectral/hash large-matrix route.
+
+Measured on 840 LoRA-like thin matrices alternating `(4096,16)` and `(16,4096)`,
+rank=4, `hash_bins=64`, `hash_tables=2`:
+
+| Route | Time | Persistent state |
+| --- | ---: | ---: |
+| Old forced spectral route, `thin_matrix_route="spectral"` | 895.358 ms/step | 372,960 elems |
+| New default thin scalar route, `thin_matrix_route="scalar"` | 568.593 ms/step | 6,720 elems |
+
+This keeps full-size tensors on the spectral CUDA path while avoiding treating
+hundreds of LoRA rank matrices as independent large spectral fields.
 
 ## Install
 
@@ -173,6 +193,11 @@ optimizer = CRESSO5(
 )
 ```
 
+For all-target LoRA with many thin matrices, the default
+`thin_matrix_route="scalar"` is usually the intended route. Use
+`thin_matrix_route="spectral"` only when you explicitly want the old spectral
+large-matrix behavior for thin matrices.
+
 For Hugging Face Trainer-style flows that accept an optimizer tuple:
 
 ```python
@@ -191,6 +216,13 @@ the actual optimizer object is already supplied.
 - `max_frequency`: maximum deterministic carrier frequency.
 - `min_spectral_size`: tensors below this size use the scalar fallback unless
   `micro_field_max_size` routes them to the micro-field path.
+- `thin_matrix_route`: controls high-aspect 2D thin matrices. The default
+  `scalar` avoids routing LoRA rank matrices through the spectral/hash
+  large-matrix path; `spectral` restores the old behavior explicitly.
+- `thin_matrix_max_width`: maximum smaller dimension for thin-matrix routing.
+  Default `64`.
+- `thin_matrix_min_aspect`: minimum long/short dimension ratio for thin-matrix
+  routing. Default `4.0`, so square matrices are not treated as LoRA-thin.
 - `hash_bins`: number of cells per hash table.
 - `hash_tables`: number of independent salted hash tables.
 - `basis_cache_limit_elements`: pure PyTorch dense transient basis cache limit.
@@ -198,8 +230,9 @@ the actual optimizer object is already supplied.
   tensors or persistent basis-cache state.
 - `hard_channel_min_size`: minimum tensor size for hash/refractory hard-channel
   logic.
-- `thin_matrix_hard_cutoff`: disables hard-channel logic for very thin matrices
-  when the smallest matrix dimension is at or below this cutoff.
+- `thin_matrix_hard_cutoff`: disables hard-channel logic inside the spectral
+  path for very thin matrices when the smallest matrix dimension is at or below
+  this cutoff. It is not the main LoRA routing control.
 - `target_update_rms`, `min_gain`, `max_gain`, `drive_clip`: control final update
   scaling and clipping.
 

@@ -134,6 +134,41 @@ class CressoV5CudaOpsTests(unittest.TestCase):
             cresso_v5.theoretical_state_elements(shape, rank=4, hash_bins=16, hash_tables=1),
         )
 
+    def test_cuda_thin_scalar_update_matches_pytorch_reference_path(self) -> None:
+        shape = (128, 16)
+        device = torch.device("cuda")
+        dtype = torch.float32
+        torch.manual_seed(2468)
+        initial = torch.randn(shape, device=device, dtype=dtype)
+        grads = [torch.randn(shape, device=device, dtype=dtype) for _ in range(2)]
+        cuda_param = torch.nn.Parameter(initial.clone())
+        ref_param = torch.nn.Parameter(initial.clone())
+        common_kwargs = dict(
+            lr=2.0e-3,
+            rank=4,
+            thin_matrix_route="scalar",
+            thin_matrix_max_width=64,
+            min_spectral_size=1,
+        )
+
+        ops = cresso_v5._load_cuda_ops(required=True)
+        self.assertTrue(hasattr(ops, "scalar_update_2d"))
+        cuda_opt = cresso_v5.CRESSO5([cuda_param], cuda_ops="required", **common_kwargs)
+        ref_opt = cresso_v5.CRESSO5([ref_param], cuda_ops="off", **common_kwargs)
+
+        for grad in grads:
+            cuda_param.grad = grad.clone()
+            ref_param.grad = grad.clone()
+            cuda_opt.step()
+            ref_opt.step()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(cuda_param, ref_param, rtol=8e-4, atol=8e-5)
+        cuda_state = cuda_opt.state[cuda_param]
+        ref_state = ref_opt.state[ref_param]
+        for name in ("q", "impulse", "metric_q", "metric_impulse", "force_rms", "drive_energy", "surprise", "action"):
+            torch.testing.assert_close(cuda_state[name], ref_state[name], rtol=8e-4, atol=8e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

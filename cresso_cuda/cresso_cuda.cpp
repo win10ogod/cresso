@@ -123,6 +123,49 @@ void drive_update_cuda(
     double max_gain,
     double drive_clip,
     double eps);
+void scalar_update_2d_cuda(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor q,
+    torch::Tensor impulse,
+    torch::Tensor metric_q,
+    torch::Tensor metric_impulse,
+    torch::Tensor force_rms,
+    torch::Tensor drive_energy,
+    torch::Tensor surprise,
+    torch::Tensor action,
+    int64_t step,
+    double lr,
+    double weight_decay,
+    double energy_power,
+    double metric_dt,
+    double metric_friction,
+    double metric_coupling,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
+    double dt,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic,
+    double reservoir_decay,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_decay,
+    double prediction_mix,
+    double novelty_mix,
+    double warmup_steps,
+    double surprise_brake,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double drive_clip,
+    double spike_mix,
+    double root_channel_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("basis_stats", &basis_stats_cuda, "CRESSO5 basis normalization stats (CUDA)");
@@ -149,4 +192,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("confidence_update", &confidence_update_cuda, "CRESSO5 fused rank confidence update (CUDA)");
     m.def("contact_update_pair", &contact_update_pair_cuda, "CRESSO5 fused rank contact oscillator update (CUDA)");
     m.def("drive_update", &drive_update_cuda, "CRESSO5 fused dense drive and parameter update (CUDA)");
+    m.def("scalar_update_2d", &scalar_update_2d_cuda, "CRESSO5 fused 2D scalar/thin-matrix update (CUDA)");
 }

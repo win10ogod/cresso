@@ -2106,6 +2106,549 @@ __global__ void param_apply_drive_kernel(scalar_t* param, const scalar_t* drive,
     }
 }
 
+__device__ __forceinline__ double clamp_double_local(double x, double lo, double hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ double scalar_force_value(
+    const scalar_t* param,
+    const scalar_t* grad,
+    int64_t i,
+    double weight_decay) {
+    double f = static_cast<double>(grad[i]);
+    if (weight_decay != 0.0) {
+        f += weight_decay * static_cast<double>(param[i]);
+    }
+    return f;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ double scalar_tangent_value_2d(
+    const scalar_t* param,
+    const scalar_t* grad,
+    const double* row_sums,
+    const double* col_sums,
+    const double* stats,
+    int64_t rows,
+    int64_t cols,
+    int64_t i,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
+    double eps) {
+    const double force = scalar_force_value(param, grad, i, weight_decay);
+    const double scale = fmax(stats[0], eps);
+    const double rel = fmin(fabs(force) / scale + eps, 1.0e4);
+    double local_metric = 1.0;
+    if (local_sharpness != 0.0) {
+        local_metric = clamp_double_local(1.0 + local_sharpness * sqrt(fmin(rel, 100.0)), 1.0, 8.0);
+    }
+    double instant_metric = 1.0;
+    const int64_t n = rows * cols;
+    if (instant_metric_coupling != 0.0 && n > 1) {
+        const int64_t row = i / cols;
+        const int64_t col = i - row * cols;
+        const double axis_mean = fmax(stats[14], eps);
+        const double row_mean = row_sums[row] / static_cast<double>(cols);
+        const double col_mean = col_sums[col] / static_cast<double>(rows);
+        const double row_norm = row_mean / axis_mean;
+        const double col_norm = col_mean / axis_mean;
+        const double power = fmax(instant_metric_power, 0.25);
+        const double log_metric = log(fmax(row_norm, eps)) + log(fmax(col_norm, eps));
+        instant_metric = clamp_double_local(exp((instant_metric_coupling / (2.0 * power)) * log_metric), 0.08, 12.0);
+    }
+    const double denom = scale * stats[1] * local_metric * instant_metric + eps;
+    return clamp_double_local(force / denom, -1.0e4, 1.0e4);
+}
+
+template <typename scalar_t>
+__global__ void scalar_force_partial_kernel(
+    const scalar_t* param,
+    const scalar_t* grad,
+    int64_t n,
+    int chunks,
+    double weight_decay,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    double sum = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double f = scalar_force_value(param, grad, i, weight_decay);
+        sum += f * f;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_force_finalize_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    int64_t step,
+    scalar_t* force_rms,
+    double reservoir_decay,
+    double eps,
+    double* stats) {
+    double sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        sum += partial[chunk];
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        const double now = sqrt(total / static_cast<double>(n) + eps);
+        const double old = static_cast<double>(*force_rms);
+        const double updated = step <= 1 ? now : old * reservoir_decay + now * (1.0 - reservoir_decay);
+        *force_rms = static_cast<scalar_t>(updated);
+        stats[0] = fmax(updated, eps);
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_axis_density_kernel(
+    const scalar_t* param,
+    const scalar_t* grad,
+    double* row_sums,
+    double* col_sums,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double weight_decay,
+    double energy_power,
+    double instant_metric_power,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    double log_sum = 0.0;
+    double axis_sum = 0.0;
+    const double scale = fmax(stats[0], eps);
+    const double axis_power = fmax(instant_metric_power, 0.25);
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double force = scalar_force_value(param, grad, i, weight_decay);
+        const double rel = fmin(fabs(force) / scale + eps, 1.0e4);
+        const double density = fmin(pow(fmax(rel, eps), axis_power), 1.0e6);
+        const int64_t row = i / cols;
+        const int64_t col = i - row * cols;
+        atomicAdd(row_sums + row, density);
+        atomicAdd(col_sums + col, density);
+        axis_sum += density;
+        log_sum += log1p(pow(rel, energy_power));
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, log_sum, axis_sum, 0.0, 0.0);
+    if (threadIdx.x == 0) {
+        double* row = partial + static_cast<int64_t>(chunk) * 2;
+        row[0] = shared[0];
+        row[1] = shared[blockDim.x];
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_metric_finalize_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    scalar_t* metric_q,
+    scalar_t* metric_impulse,
+    double metric_dt,
+    double metric_friction,
+    double metric_coupling,
+    double* stats) {
+    double log_sum = 0.0;
+    double axis_sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        const double* row = partial + static_cast<int64_t>(chunk) * 2;
+        log_sum += row[0];
+        axis_sum += row[1];
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, log_sum, axis_sum, 0.0, 0.0);
+    if (threadIdx.x == 0) {
+        double mq = static_cast<double>(*metric_q);
+        double mp = static_cast<double>(*metric_impulse);
+        const double density = shared[0] / static_cast<double>(n);
+        const double metric_port = density - tanh(mq);
+        mp *= fmax(0.0, 1.0 - metric_dt * metric_friction);
+        mp += (metric_port - mq) * metric_dt;
+        mq += mp * metric_dt;
+        mq = clamp_double_local(mq, -3.0, 3.0);
+        *metric_q = static_cast<scalar_t>(mq);
+        *metric_impulse = static_cast<scalar_t>(mp);
+        stats[1] = clamp_double_local(exp(metric_coupling * mq), 0.06, 16.0);
+        stats[14] = shared[blockDim.x] / static_cast<double>(n);
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_pre_contact_partial_kernel(
+    const scalar_t* param,
+    const scalar_t* grad,
+    const double* row_sums,
+    const double* col_sums,
+    scalar_t* tangent_out,
+    const scalar_t* q,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double weight_decay,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    const double qv = static_cast<double>(*q);
+    double err_sum = 0.0;
+    double err2_sum = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double tangent = scalar_tangent_value_2d(
+            param,
+            grad,
+            row_sums,
+            col_sums,
+            stats,
+            rows,
+            cols,
+            i,
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps);
+        tangent_out[i] = static_cast<scalar_t>(tangent);
+        const double error = tangent - qv;
+        err_sum += error;
+        err2_sum += error * error;
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, err_sum, err2_sum, 0.0, 0.0);
+    if (threadIdx.x == 0) {
+        double* row = partial + static_cast<int64_t>(chunk) * 2;
+        row[0] = shared[0];
+        row[1] = shared[blockDim.x];
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_contact_update_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    scalar_t* q,
+    scalar_t* impulse,
+    scalar_t* surprise,
+    scalar_t* action,
+    int64_t step,
+    double dt,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_decay,
+    double surprise_brake,
+    double eps,
+    double* stats) {
+    double err_sum = 0.0;
+    double err2_sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        const double* row = partial + static_cast<int64_t>(chunk) * 2;
+        err_sum += row[0];
+        err2_sum += row[1];
+    }
+    extern __shared__ double shared[];
+    reduce4(shared, err_sum, err2_sum, 0.0, 0.0);
+    if (threadIdx.x == 0) {
+        double qv = static_cast<double>(*q);
+        double iv = static_cast<double>(*impulse);
+        double sv = static_cast<double>(*surprise);
+        double av = static_cast<double>(*action);
+        const double surprise_now = sqrt(shared[blockDim.x] / static_cast<double>(n) + eps);
+        sv = step <= 1 ? surprise_now : sv * surprise_decay + surprise_now * (1.0 - surprise_decay);
+        const double port = shared[0] / static_cast<double>(n);
+        const double plasticity = 1.0 + surprise_gain * sv / (1.0 + sv);
+        const double brake = 1.0 / (1.0 + surprise_brake * sv);
+        const double energy = 0.5 * (iv * iv + qv * qv);
+        av = av * 0.985 + (port * iv - energy) * dt;
+        const double friction = impulse_friction + contact_gain * tanh(fabs(av));
+        iv *= fmax(0.0, 1.0 - dt * friction);
+        iv += (plasticity * brake * port - restoring * qv - cubic * qv * qv * qv) * dt;
+        qv += iv * dt;
+        qv = clamp_double_local(qv, -8.0, 8.0);
+        *q = static_cast<scalar_t>(qv);
+        *impulse = static_cast<scalar_t>(iv);
+        *surprise = static_cast<scalar_t>(sv);
+        *action = static_cast<scalar_t>(av);
+        stats[2] = qv;
+        stats[3] = sv;
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_drive_stats_partial_kernel(
+    const scalar_t* tangent,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    const double qv = stats[2];
+    double tf2 = 0.0;
+    double pred2 = 0.0;
+    double dot = 0.0;
+    double rational2 = 0.0;
+    double root2 = 0.0;
+    double error2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double e = t - qv;
+        const double rational = t / (1.0 + fabs(t) / clip);
+        const double root_raw = (t < 0.0 ? -1.0 : (t > 0.0 ? 1.0 : 0.0)) * sqrt(fmin(fabs(t), clip * clip) + eps);
+        tf2 += t * t;
+        pred2 += qv * qv;
+        dot += t * qv;
+        rational2 += rational * rational;
+        root2 += root_raw * root_raw;
+        error2 += e * e;
+    }
+    extern __shared__ double shared6[];
+    reduce6_local(shared6, tf2, pred2, dot, rational2, root2, error2);
+    if (threadIdx.x == 0) {
+        double* row = partial + static_cast<int64_t>(chunk) * 6;
+        row[0] = shared6[0];
+        row[1] = shared6[blockDim.x];
+        row[2] = shared6[2 * blockDim.x];
+        row[3] = shared6[3 * blockDim.x];
+        row[4] = shared6[4 * blockDim.x];
+        row[5] = shared6[5 * blockDim.x];
+    }
+}
+
+__global__ void scalar_drive_stats_finalize_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    int64_t step,
+    double prediction_mix,
+    int64_t warmup_steps,
+    double eps,
+    double* stats) {
+    double sums[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        const double* row = partial + static_cast<int64_t>(chunk) * 6;
+        sums[0] += row[0];
+        sums[1] += row[1];
+        sums[2] += row[2];
+        sums[3] += row[3];
+        sums[4] += row[4];
+        sums[5] += row[5];
+    }
+    extern __shared__ double shared6[];
+    reduce6_local(shared6, sums[0], sums[1], sums[2], sums[3], sums[4], sums[5]);
+    if (threadIdx.x == 0) {
+        const double inv_n = 1.0 / static_cast<double>(n);
+        const double force_rms = sqrt(shared6[0] * inv_n + eps);
+        const double pred_rms = sqrt(shared6[blockDim.x] * inv_n + eps);
+        const double rational_rms = sqrt(shared6[3 * blockDim.x] * inv_n + eps);
+        const double root_rms = sqrt(shared6[4 * blockDim.x] * inv_n + eps);
+        const double error_rms = sqrt(shared6[5 * blockDim.x] * inv_n + eps);
+        double align_gate = 0.0;
+        if (pred_rms > sqrt(eps)) {
+            const double alignment = clamp_double_local((shared6[2 * blockDim.x] * inv_n) / (force_rms * pred_rms + eps), -1.0, 1.0);
+            align_gate = clamp_double_local((alignment + 1.0) * 0.5, 0.0, 1.0);
+        }
+        const double warmup = warmup_steps == 0 ? 1.0 : (1.0 - exp(-static_cast<double>(step) / fmax(1.0, static_cast<double>(warmup_steps))));
+        const double surprise = stats[3];
+        stats[4] = force_rms;
+        stats[5] = pred_rms;
+        stats[6] = rational_rms;
+        stats[7] = root_rms;
+        stats[8] = error_rms;
+        stats[9] = prediction_mix * warmup * align_gate / (1.0 + surprise);
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ double scalar_shaped_value(double t, const double* stats, double root_channel_mix, double spike_mix, double clip, double eps) {
+    const double rational = t / (1.0 + fabs(t) / clip);
+    const double bounded = tanh(t / clip) * clip;
+    const double root_raw = (t < 0.0 ? -1.0 : (t > 0.0 ? 1.0 : 0.0)) * sqrt(fmin(fabs(t), clip * clip) + eps);
+    const double root = root_raw * (stats[6] / fmax(stats[7], eps));
+    const double spike = spike_mix / (1.0 + stats[3]);
+    const double base = (1.0 - spike) * rational + spike * bounded;
+    const double root_mix = root_channel_mix / (1.0 + 0.5 * stats[3]);
+    return (1.0 - root_mix) * base + root_mix * root;
+}
+
+template <typename scalar_t>
+__global__ void scalar_shaped_partial_kernel(
+    const scalar_t* tangent,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    double shaped2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double shaped = scalar_shaped_value<scalar_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
+        shaped2 += shaped * shaped;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(shaped2, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+__global__ void scalar_one_stat_finalize_kernel(const double* partial, int chunks, int64_t n, double eps, double* stats, int64_t index) {
+    double sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        sum += partial[chunk];
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        stats[index] = sqrt(total / static_cast<double>(n) + eps);
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_core_partial_kernel(
+    const scalar_t* tangent,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double direct_force_mix,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    const double direct_mix = direct_force_mix / (1.0 + 0.35 * stats[3]);
+    double core2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double shaped = scalar_shaped_value<scalar_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
+        const double direct = t * (stats[10] / fmax(stats[4], eps));
+        const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
+        core2 += core * core;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(core2, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_drive_partial_kernel(
+    const scalar_t* tangent,
+    scalar_t* drive,
+    int64_t rows,
+    int64_t cols,
+    int chunks,
+    const double* stats,
+    double novelty_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double root_channel_mix,
+    double spike_mix,
+    double clip,
+    double eps,
+    double* partial) {
+    const int chunk = blockIdx.x;
+    const int64_t n = rows * cols;
+    const double qv = stats[2];
+    const double direct_mix = direct_force_mix / (1.0 + 0.35 * stats[3]);
+    const double residual_mix = residual_feedback_mix / (1.0 + stats[3]);
+    double drive2 = 0.0;
+    for (int64_t i = static_cast<int64_t>(chunk) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(chunks) * blockDim.x) {
+        const double t = static_cast<double>(tangent[i]);
+        const double error = t - qv;
+        const double shaped = scalar_shaped_value<scalar_t>(t, stats, root_channel_mix, spike_mix, clip, eps);
+        const double direct = t * (stats[10] / fmax(stats[4], eps));
+        const double core = (1.0 - direct_mix) * shaped + direct_mix * direct;
+        const double residual = error * (stats[11] / fmax(stats[8], eps));
+        const double novelty = tanh(error / (clip * (1.0 + stats[3]))) * clip;
+        const double d = (1.0 - stats[9]) * core + stats[9] * qv + novelty_mix * novelty + residual_mix * residual;
+        drive[i] = static_cast<scalar_t>(d);
+        drive2 += d * d;
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(drive2, shared);
+    if (threadIdx.x == 0) {
+        partial[chunk] = total;
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_gain_finalize_kernel(
+    const double* partial,
+    int chunks,
+    int64_t n,
+    int64_t step,
+    scalar_t* drive_energy,
+    double reservoir_decay,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double eps,
+    double* stats) {
+    double sum = 0.0;
+    for (int chunk = threadIdx.x; chunk < chunks; chunk += blockDim.x) {
+        sum += partial[chunk];
+    }
+    extern __shared__ double shared[];
+    const double total = block_sum_local(sum, shared);
+    if (threadIdx.x == 0) {
+        const double now = total / static_cast<double>(n);
+        const double old = static_cast<double>(*drive_energy);
+        const double updated = step <= 1 ? now : old * reservoir_decay + now * (1.0 - reservoir_decay);
+        *drive_energy = static_cast<scalar_t>(updated);
+        stats[12] = clamp_double_local(target_update_rms / sqrt(updated + eps), min_gain, max_gain);
+    }
+}
+
+template <typename scalar_t>
+__global__ void scalar_param_apply_kernel(scalar_t* param, const scalar_t* drive, const double* stats, int64_t n, double lr) {
+    const double gain = stats[12];
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        param[i] = static_cast<scalar_t>(static_cast<double>(param[i]) - lr * static_cast<double>(drive[i]) * gain);
+    }
+}
+
 }  // namespace
 
 void drive_update_cuda(
@@ -2299,6 +2842,281 @@ void drive_update_cuda(
             param.data_ptr<scalar_t>(),
             drive.data_ptr<scalar_t>(),
             gain.data_ptr<double>(),
+            n,
+            lr);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void scalar_update_2d_cuda(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor q,
+    torch::Tensor impulse,
+    torch::Tensor metric_q,
+    torch::Tensor metric_impulse,
+    torch::Tensor force_rms,
+    torch::Tensor drive_energy,
+    torch::Tensor surprise,
+    torch::Tensor action,
+    int64_t step,
+    double lr,
+    double weight_decay,
+    double energy_power,
+    double metric_dt,
+    double metric_friction,
+    double metric_coupling,
+    double local_sharpness,
+    double instant_metric_coupling,
+    double instant_metric_power,
+    double dt,
+    double impulse_friction,
+    double contact_gain,
+    double restoring,
+    double cubic,
+    double reservoir_decay,
+    double refractory_gain,
+    double surprise_gain,
+    double surprise_decay,
+    double prediction_mix,
+    double novelty_mix,
+    double warmup_steps,
+    double surprise_brake,
+    double target_update_rms,
+    double min_gain,
+    double max_gain,
+    double drive_clip,
+    double spike_mix,
+    double root_channel_mix,
+    double direct_force_mix,
+    double residual_feedback_mix,
+    double eps) {
+    TORCH_CHECK(param.is_cuda() && grad.is_cuda(), "scalar_update_2d tensors must be CUDA");
+    TORCH_CHECK(param.dim() == 2 && grad.dim() == 2, "scalar_update_2d requires 2D tensors");
+    TORCH_CHECK(param.is_contiguous() && grad.is_contiguous(), "scalar_update_2d requires contiguous tensors");
+    TORCH_CHECK(param.scalar_type() == grad.scalar_type(), "scalar_update_2d dtype mismatch");
+    TORCH_CHECK(param.scalar_type() == at::kFloat || param.scalar_type() == at::kDouble, "scalar_update_2d supports float32 and float64 params");
+    TORCH_CHECK(param.sizes() == grad.sizes(), "scalar_update_2d shape mismatch");
+    TORCH_CHECK(q.is_cuda() && impulse.is_cuda() && metric_q.is_cuda() && metric_impulse.is_cuda() && force_rms.is_cuda() &&
+                    drive_energy.is_cuda() && surprise.is_cuda() && action.is_cuda(),
+                "scalar_update_2d state must be CUDA");
+    TORCH_CHECK(q.dim() == 0 && impulse.dim() == 0 && metric_q.dim() == 0 && metric_impulse.dim() == 0 && force_rms.dim() == 0 &&
+                    drive_energy.dim() == 0 && surprise.dim() == 0 && action.dim() == 0,
+                "scalar_update_2d state must be scalar tensors");
+    TORCH_CHECK(q.scalar_type() == param.scalar_type() && impulse.scalar_type() == param.scalar_type() &&
+                    metric_q.scalar_type() == param.scalar_type() && metric_impulse.scalar_type() == param.scalar_type() &&
+                    force_rms.scalar_type() == param.scalar_type() && drive_energy.scalar_type() == param.scalar_type() &&
+                    surprise.scalar_type() == param.scalar_type() && action.scalar_type() == param.scalar_type(),
+                "scalar_update_2d state dtype mismatch");
+
+    const c10::cuda::CUDAGuard device_guard(param.device());
+    const int64_t rows = param.size(0);
+    const int64_t cols = param.size(1);
+    const int64_t n = param.numel();
+    const int chunks = choose_chunks(n);
+    const int blocks = std::min<int64_t>(65535, std::max<int64_t>(1, (n + kThreads - 1) / kThreads));
+    auto partial1 = torch::empty({chunks}, param.options().dtype(torch::kFloat64));
+    auto partial2 = torch::empty({chunks, 2}, param.options().dtype(torch::kFloat64));
+    auto partial6 = torch::empty({chunks, 6}, param.options().dtype(torch::kFloat64));
+    auto row_sums = torch::empty({rows}, param.options().dtype(torch::kFloat64));
+    auto col_sums = torch::empty({cols}, param.options().dtype(torch::kFloat64));
+    auto stats = torch::empty({16}, param.options().dtype(torch::kFloat64));
+    auto tangent = torch::empty_like(param);
+    auto drive = torch::empty_like(param);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES(param.scalar_type(), "scalar_update_2d_cuda", [&] {
+        scalar_force_partial_kernel<scalar_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            param.data_ptr<scalar_t>(),
+            grad.data_ptr<scalar_t>(),
+            n,
+            chunks,
+            weight_decay,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_force_finalize_kernel<scalar_t><<<1, kThreads, kThreads * sizeof(double), stream>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            step,
+            force_rms.data_ptr<scalar_t>(),
+            reservoir_decay,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        C10_CUDA_CHECK(cudaMemsetAsync(row_sums.data_ptr<double>(), 0, static_cast<size_t>(rows) * sizeof(double), stream));
+        C10_CUDA_CHECK(cudaMemsetAsync(col_sums.data_ptr<double>(), 0, static_cast<size_t>(cols) * sizeof(double), stream));
+        scalar_axis_density_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            4 * kThreads * sizeof(double),
+            stream>>>(
+            param.data_ptr<scalar_t>(),
+            grad.data_ptr<scalar_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            weight_decay,
+            energy_power,
+            instant_metric_power,
+            eps,
+            partial2.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_metric_finalize_kernel<scalar_t><<<1, kThreads, 4 * kThreads * sizeof(double), stream>>>(
+            partial2.data_ptr<double>(),
+            chunks,
+            n,
+            metric_q.data_ptr<scalar_t>(),
+            metric_impulse.data_ptr<scalar_t>(),
+            metric_dt,
+            metric_friction,
+            metric_coupling,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_pre_contact_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            4 * kThreads * sizeof(double),
+            stream>>>(
+            param.data_ptr<scalar_t>(),
+            grad.data_ptr<scalar_t>(),
+            row_sums.data_ptr<double>(),
+            col_sums.data_ptr<double>(),
+            tangent.data_ptr<scalar_t>(),
+            q.data_ptr<scalar_t>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            weight_decay,
+            local_sharpness,
+            instant_metric_coupling,
+            instant_metric_power,
+            eps,
+            partial2.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_contact_update_kernel<scalar_t><<<1, kThreads, 4 * kThreads * sizeof(double), stream>>>(
+            partial2.data_ptr<double>(),
+            chunks,
+            n,
+            q.data_ptr<scalar_t>(),
+            impulse.data_ptr<scalar_t>(),
+            surprise.data_ptr<scalar_t>(),
+            action.data_ptr<scalar_t>(),
+            step,
+            dt,
+            impulse_friction,
+            contact_gain,
+            restoring,
+            cubic,
+            refractory_gain,
+            surprise_gain,
+            surprise_decay,
+            surprise_brake,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_drive_stats_partial_kernel<scalar_t><<<
+            chunks,
+            kThreads,
+            6 * kThreads * sizeof(double),
+            stream>>>(
+            tangent.data_ptr<scalar_t>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            drive_clip,
+            eps,
+            partial6.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_drive_stats_finalize_kernel<<<1, kThreads, 6 * kThreads * sizeof(double), stream>>>(
+            partial6.data_ptr<double>(),
+            chunks,
+            n,
+            step,
+            prediction_mix,
+            static_cast<int64_t>(warmup_steps),
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_shaped_partial_kernel<scalar_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            tangent.data_ptr<scalar_t>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_one_stat_finalize_kernel<<<1, kThreads, kThreads * sizeof(double), stream>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            eps,
+            stats.data_ptr<double>(),
+            10);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_core_partial_kernel<scalar_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            tangent.data_ptr<scalar_t>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            direct_force_mix,
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_one_stat_finalize_kernel<<<1, kThreads, kThreads * sizeof(double), stream>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            eps,
+            stats.data_ptr<double>(),
+            11);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_drive_partial_kernel<scalar_t><<<chunks, kThreads, kThreads * sizeof(double), stream>>>(
+            tangent.data_ptr<scalar_t>(),
+            drive.data_ptr<scalar_t>(),
+            rows,
+            cols,
+            chunks,
+            stats.data_ptr<double>(),
+            novelty_mix,
+            direct_force_mix,
+            residual_feedback_mix,
+            root_channel_mix,
+            spike_mix,
+            drive_clip,
+            eps,
+            partial1.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_gain_finalize_kernel<scalar_t><<<1, kThreads, kThreads * sizeof(double), stream>>>(
+            partial1.data_ptr<double>(),
+            chunks,
+            n,
+            step,
+            drive_energy.data_ptr<scalar_t>(),
+            reservoir_decay,
+            target_update_rms,
+            min_gain,
+            max_gain,
+            eps,
+            stats.data_ptr<double>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        scalar_param_apply_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
+            param.data_ptr<scalar_t>(),
+            drive.data_ptr<scalar_t>(),
+            stats.data_ptr<double>(),
             n,
             lr);
     });
