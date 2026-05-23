@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+from unittest import mock
 import unittest
+import types
 from pathlib import Path
 
 import torch
@@ -104,6 +106,44 @@ class CressoV5CudaOpsTests(unittest.TestCase):
         ):
             torch.testing.assert_close(cuda_state[name], ref_state[name], rtol=8e-4, atol=8e-5)
 
+    def test_cuda_spectral_update_supports_fp16_and_bf16_params(self) -> None:
+        shape = (31, 37)
+        device = torch.device("cuda")
+        dtypes = [torch.float16]
+        if torch.cuda.is_bf16_supported():
+            dtypes.append(torch.bfloat16)
+
+        for dtype in dtypes:
+            with self.subTest(dtype=str(dtype)):
+                torch.manual_seed(8642)
+                initial = (0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype)
+                grad = (0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype)
+                cuda_param = torch.nn.Parameter(initial.clone())
+                ref_param = torch.nn.Parameter(initial.clone())
+                cuda_param.grad = grad.clone()
+                ref_param.grad = grad.clone()
+                common_kwargs = dict(
+                    lr=1.0e-3,
+                    rank=8,
+                    max_frequency=5,
+                    min_spectral_size=1,
+                    hard_channel_min_size=1,
+                    thin_matrix_hard_cutoff=0,
+                    hash_bins=37,
+                    hash_tables=2,
+                    basis_cache_limit_elements=0,
+                )
+                cuda_opt = cresso_v5.CRESSO5([cuda_param], cuda_ops="required", **common_kwargs)
+                ref_opt = cresso_v5.CRESSO5([ref_param], cuda_ops="off", **common_kwargs)
+
+                cuda_opt.step()
+                ref_opt.step()
+                torch.cuda.synchronize()
+
+                atol = 3.0e-3 if dtype is torch.float16 else 3.0e-2
+                torch.testing.assert_close(cuda_param.float(), ref_param.float(), rtol=0.0, atol=atol)
+                self.assertEqual(cuda_opt.state[cuda_param]["q_cos"].dtype, torch.float32)
+
     def test_cuda_fast_path_does_not_add_persistent_basis_cache_state(self) -> None:
         shape = (128, 128)
         device = torch.device("cuda")
@@ -168,6 +208,61 @@ class CressoV5CudaOpsTests(unittest.TestCase):
         ref_state = ref_opt.state[ref_param]
         for name in ("q", "impulse", "metric_q", "metric_impulse", "force_rms", "drive_energy", "surprise", "action"):
             torch.testing.assert_close(cuda_state[name], ref_state[name], rtol=8e-4, atol=8e-5)
+
+    def test_cuda_thin_scalar_update_supports_fp16_and_bf16_params(self) -> None:
+        shape = (64, 16)
+        device = torch.device("cuda")
+        dtypes = [torch.float16]
+        if torch.cuda.is_bf16_supported():
+            dtypes.append(torch.bfloat16)
+
+        for dtype in dtypes:
+            with self.subTest(dtype=str(dtype)):
+                torch.manual_seed(3579)
+                initial = (0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype)
+                grads = [(0.05 * torch.randn(shape, device=device, dtype=torch.float32)).to(dtype) for _ in range(2)]
+                cuda_param = torch.nn.Parameter(initial.clone())
+                ref_param = torch.nn.Parameter(initial.clone())
+                common_kwargs = dict(
+                    lr=1.0e-3,
+                    rank=4,
+                    thin_matrix_route="scalar",
+                    thin_matrix_max_width=64,
+                    min_spectral_size=1,
+                )
+                cuda_opt = cresso_v5.CRESSO5([cuda_param], cuda_ops="required", **common_kwargs)
+                ref_opt = cresso_v5.CRESSO5([ref_param], cuda_ops="off", **common_kwargs)
+
+                for grad in grads:
+                    cuda_param.grad = grad.clone()
+                    ref_param.grad = grad.clone()
+                    cuda_opt.step()
+                    ref_opt.step()
+                torch.cuda.synchronize()
+
+                atol = 2.5e-3 if dtype is torch.float16 else 2.5e-2
+                torch.testing.assert_close(cuda_param.float(), ref_param.float(), rtol=0.0, atol=atol)
+                cuda_state = cuda_opt.state[cuda_param]
+                ref_state = ref_opt.state[ref_param]
+                self.assertEqual(cuda_state["q"].dtype, torch.float32)
+                for name in ("q", "impulse", "metric_q", "metric_impulse", "force_rms", "drive_energy", "surprise", "action"):
+                    torch.testing.assert_close(cuda_state[name], ref_state[name], rtol=5e-3, atol=5e-4)
+
+    def test_cuda_ops_required_does_not_silently_skip_mixed_precision_scalar_op(self) -> None:
+        device = torch.device("cuda")
+        p = torch.nn.Parameter(torch.randn((32, 8), device=device, dtype=torch.float16))
+        p.grad = torch.randn_like(p)
+        opt = cresso_v5.CRESSO5(
+            [p],
+            cuda_ops="required",
+            rank=4,
+            thin_matrix_route="scalar",
+            thin_matrix_max_width=64,
+            min_spectral_size=1,
+        )
+        with mock.patch.object(cresso_v5, "_load_cuda_ops", return_value=types.SimpleNamespace()):
+            with self.assertRaisesRegex(RuntimeError, "scalar_update_2d"):
+                opt.step()
 
 
 if __name__ == "__main__":

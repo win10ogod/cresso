@@ -48,6 +48,14 @@ _CRESSO_CUDA_ERROR: Exception | None = None
 _CRESSO_CUDA_WARNED = False
 
 
+def _is_unsafe_cuda_extension_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "refuse to build without a native GPU architecture" in text
+        or "does not include native GPU architecture" in text
+    )
+
+
 def _load_cuda_ops(required: bool = False):
     """Load optional fused CUDA operators for CRESSO5.
 
@@ -73,6 +81,10 @@ def _load_cuda_ops(required: bool = False):
         return _CRESSO_CUDA_OPS
     except Exception as exc:  # pragma: no cover - exercised only on local build failures
         _CRESSO_CUDA_ERROR = exc
+        if _is_unsafe_cuda_extension_error(exc):
+            raise RuntimeError(
+                f"CRESSO5 refused unsafe CUDA extension build instead of falling back silently: {exc}"
+            ) from exc
         if required:
             raise RuntimeError(f"CRESSO5 CUDA ops failed to load: {exc}") from exc
         if not _CRESSO_CUDA_WARNED:
@@ -822,6 +834,8 @@ class CRESSO5(Optimizer):
                     raise RuntimeError("CRESSO5 does not support sparse gradients")
                 if group["maximize"]:
                     grad = -grad
+                if str(group.get("cuda_ops", "auto")) == "required" and not param.is_cuda:
+                    raise RuntimeError("CRESSO5 cuda_ops='required' requires every optimized parameter to be a CUDA parameter")
                 if int(group.get("micro_field_max_size", 0)) > 0 and param.ndim > 0 and param.numel() <= int(group["micro_field_max_size"]):
                     self._micro_step(param, grad, group)
                 elif self._use_spectral_route(param, group):
@@ -885,8 +899,10 @@ class CRESSO5(Optimizer):
 
     def _update_reservoir(self, old: Tensor, current: Tensor, decay: float, step: int) -> Tensor:
         if step <= 1:
-            return current.detach().clone().to(old.dtype)
-        return old.mul(float(decay)).add(current.detach().to(old.dtype), alpha=1.0 - float(decay))
+            old.copy_(current.detach().to(device=old.device, dtype=old.dtype))
+            return old
+        old.mul_(float(decay)).add_(current.detach().to(device=old.device, dtype=old.dtype), alpha=1.0 - float(decay))
+        return old
 
     def _base_force(self, param: Tensor, grad: Tensor, group: dict, dtype: torch.dtype) -> Tensor:
         force = grad.to(dtype=dtype)
@@ -1248,7 +1264,7 @@ class CRESSO5(Optimizer):
             and tangent_force.is_contiguous()
             and pred.is_contiguous()
             and error.is_contiguous()
-            and param.dtype == dtype
+            and param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
             and dtype in (torch.float32, torch.float64)
             and state["surprise"].dtype == dtype
             and state["drive_energy"].dtype == dtype
@@ -1432,15 +1448,15 @@ class CRESSO5(Optimizer):
             and grad.is_cuda
             and param.ndim == 2
             and param.is_contiguous()
-            and param.dtype in (torch.float32, torch.float64)
-            and grad.dtype == param.dtype
-            and state["q"].dtype == param.dtype
+            and param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+            and dtype in (torch.float32, torch.float64)
+            and state["q"].dtype == dtype
         ):
             ops = _load_cuda_ops(required=cuda_mode == "required")
             if ops is not None and hasattr(ops, "scalar_update_2d"):
                 ops.scalar_update_2d(
                     param,
-                    grad.contiguous(),
+                    grad.to(dtype=dtype).contiguous(),
                     state["q"],
                     state["impulse"],
                     state["metric_q"],
@@ -1483,6 +1499,8 @@ class CRESSO5(Optimizer):
                     eps,
                 )
                 return
+            if cuda_mode == "required":
+                raise RuntimeError("CRESSO5 cuda_ops='required' requires scalar_update_2d for eligible 2D parameters")
 
         force = self._base_force(param, grad, group, dtype)
         force_rms_now = torch.sqrt(force.pow(2).mean() + eps)
