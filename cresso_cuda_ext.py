@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import warnings
 from pathlib import Path
 from types import ModuleType
@@ -16,11 +17,55 @@ from torch.utils.cpp_extension import load
 
 _MODULE: ModuleType | None = None
 _MODULE_NAME: str | None = None
-_EXTENSION_ABI_TAG = "safe5"
+_EXTENSION_ABI_TAG = "safe6"
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _sanitize_component(value: object) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "_", str(value)).strip("_").lower() or "unknown"
+
+
+def _build_cache_namespace() -> str:
+    py_tag = f"py{sys.version_info.major}{sys.version_info.minor}"
+    torch_tag = _sanitize_component(getattr(torch, "__version__", "torch"))
+    cuda_tag = _sanitize_component(torch.version.cuda or "cpu")
+    return f"{py_tag}_torch{torch_tag}_cuda{cuda_tag}"
+
+
+def _cresso_cache_root() -> Path:
+    base = Path(os.environ.get("CRESSO_CUDA_BUILD_ROOT", Path.home() / ".cache" / "cresso_cuda_extensions"))
+    return base.expanduser() / _build_cache_namespace()
+
+
+def _stable_source_paths(paths: list[str], source_hash: str) -> list[str]:
+    source_dir = _cresso_cache_root() / "sources" / source_hash
+    source_dir.mkdir(parents=True, exist_ok=True)
+    stable_paths: list[str] = []
+    for path in paths:
+        src = Path(path)
+        dst = source_dir / src.name
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            shutil.copy2(src, dst)
+        stable_paths.append(str(dst))
+    return stable_paths
+
+
+def _extension_build_directory(module_name: str) -> Path:
+    build_dir = _cresso_cache_root() / "build" / module_name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return build_dir
+
+
+def _configure_build_parallelism() -> None:
+    if os.environ.get("MAX_JOBS"):
+        return
+    jobs = os.environ.get("CRESSO_CUDA_MAX_JOBS", "1").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", jobs):
+        raise RuntimeError(f"CRESSO_CUDA_MAX_JOBS must be a positive integer, got {jobs!r}")
+    os.environ["MAX_JOBS"] = jobs
 
 
 def _torch_cuda_version_tuple() -> tuple[int, int] | None:
@@ -349,8 +394,8 @@ def _source_hash(paths: list[str]) -> str:
 
 
 def _extension_module_name(arch_list: str, source_hash: str | None = None) -> str:
-    suffix = re.sub(r"[^0-9A-Za-z]+", "_", arch_list).strip("_").lower() or "default"
-    src = re.sub(r"[^0-9A-Za-z]+", "_", source_hash or "nosrc").strip("_").lower()
+    suffix = _sanitize_component(arch_list) or "default"
+    src = _sanitize_component(source_hash or "nosrc")
     return f"cresso_v5_cuda_{suffix}_{src}_{_EXTENSION_ABI_TAG}"
 
 
@@ -360,22 +405,27 @@ def load_cuda_ops(*, verbose: bool | None = None) -> ModuleType:
         raise RuntimeError("CRESSO5 CUDA ops require torch.cuda.is_available()")
 
     root = Path(__file__).resolve().parent
-    sources = [
+    source_paths = [
         str(root / "cresso_cuda" / "cresso_cuda.cpp"),
         str(root / "cresso_cuda" / "cresso_cuda_kernel.cu"),
     ]
     if verbose is None:
         verbose = os.environ.get("CRESSO_CUDA_VERBOSE", "0").lower() in {"1", "true", "yes", "on"}
     arch_list = _configure_cuda_arch_list()
-    module_name = _extension_module_name(arch_list, _source_hash(sources))
+    source_hash = _source_hash(source_paths)
+    sources = _stable_source_paths(source_paths, source_hash)
+    module_name = _extension_module_name(arch_list, source_hash)
     if _MODULE is not None and _MODULE_NAME == module_name:
         return _MODULE
 
+    _configure_build_parallelism()
+    build_directory = _extension_build_directory(module_name)
     cuda_lib = _cuda_lib_dir(os.environ.get("CUDA_HOME"))
     extra_ldflags = [f"-Wl,-rpath,{cuda_lib}"] if cuda_lib is not None else []
     _MODULE = load(
         name=module_name,
         sources=sources,
+        build_directory=str(build_directory),
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
         extra_ldflags=extra_ldflags,

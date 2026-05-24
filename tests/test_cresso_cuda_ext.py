@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 import warnings
@@ -128,6 +129,54 @@ class CressoCudaExtArchTests(unittest.TestCase):
     def test_extension_module_name_includes_source_hash(self) -> None:
         name = cresso_cuda_ext._extension_module_name("12.0", "deadbeef1234")
         self.assertIn("deadbeef1234", name)
+
+    def test_extension_abi_tag_forces_rebuild_after_loader_safety_changes(self) -> None:
+        name = cresso_cuda_ext._extension_module_name("12.0", "deadbeef1234")
+
+        self.assertIn("safe6", name)
+        self.assertNotIn("safe5", name)
+
+    def test_stable_source_paths_copy_sources_into_linux_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src"
+            src_dir.mkdir()
+            cpp = src_dir / "cresso_cuda.cpp"
+            cu = src_dir / "cresso_cuda_kernel.cu"
+            cpp.write_text("// cpp\n", encoding="utf-8")
+            cu.write_text("// cu\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CRESSO_CUDA_BUILD_ROOT": str(Path(tmp) / "cache")}, clear=True):
+                copied = cresso_cuda_ext._stable_source_paths([str(cpp), str(cu)], "abc123")
+
+            copied_paths = [Path(path) for path in copied]
+            self.assertEqual([path.name for path in copied_paths], ["cresso_cuda.cpp", "cresso_cuda_kernel.cu"])
+            for path in copied_paths:
+                self.assertTrue(path.is_file())
+                self.assertIn("abc123", path.as_posix())
+                self.assertNotEqual(path.parent, src_dir)
+            self.assertEqual(copied_paths[0].read_text(encoding="utf-8"), "// cpp\n")
+            self.assertEqual(copied_paths[1].read_text(encoding="utf-8"), "// cu\n")
+
+    def test_build_directory_is_under_cresso_cache_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"CRESSO_CUDA_BUILD_ROOT": tmp}, clear=True):
+                build_dir = cresso_cuda_ext._extension_build_directory("cresso_v5_cuda_test_safe6")
+
+        self.assertTrue(build_dir.name.endswith("safe6"))
+        self.assertIn(f"py{sys.version_info.major}{sys.version_info.minor}", build_dir.as_posix())
+
+    def test_build_parallelism_defaults_to_single_job_but_respects_existing_max_jobs(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cresso_cuda_ext._configure_build_parallelism()
+            self.assertEqual(os.environ["MAX_JOBS"], "1")
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "3"}, clear=True):
+            cresso_cuda_ext._configure_build_parallelism()
+            self.assertEqual(os.environ["MAX_JOBS"], "3")
+
+        with mock.patch.dict(os.environ, {"CRESSO_CUDA_MAX_JOBS": "2"}, clear=True):
+            cresso_cuda_ext._configure_build_parallelism()
+            self.assertEqual(os.environ["MAX_JOBS"], "2")
 
 
 if __name__ == "__main__":
